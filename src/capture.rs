@@ -1,0 +1,355 @@
+use anyhow::{Context as _, Result, bail};
+use rav1e::prelude::*;
+use scap::{
+    capturer::{Capturer, Options, Resolution},
+    frame::{Frame, FrameType, VideoFrame},
+};
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
+};
+use tokio::sync::mpsc;
+
+#[cfg(target_os = "macos")]
+mod h264;
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // The alternate variant is selected by changing CODEC.
+pub enum Codec {
+    Av1,
+    H264,
+}
+
+// H.264 uses VideoToolbox hardware encoding on macOS; AV1 uses rav1e.
+pub const CODEC: Codec = Codec::H264;
+pub const FPS: u32 = 30;
+// AV1 4:2:0 requires both stream dimensions to be even.
+pub const STREAM_WIDTH: usize = 1920;
+pub const STREAM_HEIGHT: usize = 1080;
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub struct EncodedFrame {
+    pub data: Vec<u8>,
+    pub duration: Duration,
+}
+
+struct RawFrame {
+    bgra: Vec<u8>,
+    width: usize,
+    height: usize,
+    stride: usize,
+    captured_at: SystemTime,
+}
+
+struct FrameSlot {
+    frame: Option<Arc<RawFrame>>,
+    closed: bool,
+}
+
+type LatestFrame = Arc<(Mutex<FrameSlot>, Condvar)>;
+
+pub struct Session {
+    stop: Arc<AtomicBool>,
+    frames: LatestFrame,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.frames.0.lock().unwrap().closed = true;
+        self.frames.1.notify_all();
+    }
+}
+
+pub fn spawn(sender: mpsc::Sender<EncodedFrame>) -> (Session, mpsc::Receiver<String>) {
+    let latest = Arc::new((
+        Mutex::new(FrameSlot {
+            frame: None,
+            closed: false,
+        }),
+        Condvar::new(),
+    ));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (errors, receiver) = mpsc::channel(1);
+    let frames = latest.clone();
+    let capture_frames = latest.clone();
+    let capture_stop = stop.clone();
+    let capture_errors = errors.clone();
+    std::thread::Builder::new()
+        .name("beam-capture".into())
+        .spawn(move || {
+            if let Err(error) = capture_inner(capture_frames.clone(), capture_stop) {
+                tracing::error!(error = ?error, "capture stopped");
+                let _ = capture_errors.blocking_send(error.to_string());
+            }
+            capture_frames.0.lock().unwrap().closed = true;
+            capture_frames.1.notify_all();
+        })
+        .expect("capture thread");
+    std::thread::Builder::new()
+        .name("beam-av1".into())
+        .spawn(move || {
+            if let Err(error) = encode(frames, sender) {
+                tracing::error!(error = ?error, "video encoder stopped");
+                let _ = errors.blocking_send(error.to_string());
+            }
+        })
+        .expect("encoder thread");
+    (
+        Session {
+            stop,
+            frames: latest,
+        },
+        receiver,
+    )
+}
+
+fn capture_inner(latest: LatestFrame, stop: Arc<AtomicBool>) -> Result<()> {
+    if !scap::is_supported() {
+        bail!("screen capture is unsupported on this platform");
+    }
+    if !scap::has_permission() && !scap::request_permission() {
+        bail!("Screen Recording permission was not granted");
+    }
+
+    // sc-cap 0.2.0's macOS NV12 conversion incorrectly copies plane 0 twice.
+    // BGRA is correct and keeps that dependency bug outside our media pipeline.
+    let mut capturer = Capturer::build(Options {
+        fps: FPS,
+        show_cursor: true,
+        output_type: FrameType::BGRAFrame,
+        output_resolution: Resolution::Captured,
+        ..Default::default()
+    })
+    .map_err(|error| anyhow::anyhow!(error))?;
+    capturer.start_capture();
+
+    let mut last_frame = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let Some(frame) = capturer
+            .try_get_next_frame()
+            .context("read screen capture frame")?
+        else {
+            if last_frame.elapsed() >= CAPTURE_TIMEOUT {
+                bail!("screen capture produced no frames for two seconds");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        if let Frame::Video(VideoFrame::BGRA(frame)) = frame
+            && frame.width >= 2
+            && frame.height >= 2
+        {
+            last_frame = Instant::now();
+            let stride = frame.width as usize;
+            latest.0.lock().unwrap().frame = Some(Arc::new(RawFrame {
+                bgra: frame.data,
+                width: stride,
+                height: frame.height as usize,
+                stride,
+                captured_at: frame.display_time,
+            }));
+            latest.1.notify_one();
+        }
+    }
+    capturer.stop_capture();
+    Ok(())
+}
+
+fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result<()> {
+    match CODEC {
+        Codec::Av1 => encode_av1(frames, sender),
+        Codec::H264 => {
+            #[cfg(target_os = "macos")]
+            return h264::encode(frames, sender);
+            #[cfg(not(target_os = "macos"))]
+            bail!("H.264 hardware encoding is currently supported only on macOS")
+        }
+    }
+}
+
+fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
+    let mut slot = frames.0.lock().unwrap();
+    while slot.frame.is_none() && !slot.closed {
+        slot = frames.1.wait(slot).unwrap();
+    }
+    slot.frame.take()
+}
+
+fn encode_av1(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result<()> {
+    let mut encoder = new_encoder()?;
+    let mut previous_time = None;
+    loop {
+        let Some(source) = next_frame(&frames) else {
+            return Ok(());
+        };
+        let mut frame = encoder.new_frame();
+        copy_bgra(&source, &mut frame)?;
+        encoder.send_frame(frame).context("queue AV1 frame")?;
+        let duration = previous_time
+            .and_then(|time| source.captured_at.duration_since(time).ok())
+            .unwrap_or(Duration::from_secs_f64(1.0 / FPS as f64))
+            .clamp(Duration::from_millis(1), Duration::from_secs(1));
+        previous_time = Some(source.captured_at);
+
+        while let Ok(packet) = encoder.receive_packet() {
+            if sender
+                .blocking_send(EncodedFrame {
+                    data: packet.data,
+                    duration,
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn new_encoder() -> Result<Context<u8>> {
+    let mut encoder = EncoderConfig::with_speed_preset(10);
+    encoder.width = STREAM_WIDTH;
+    encoder.height = STREAM_HEIGHT;
+    encoder.time_base = Rational::new(1, 1_000);
+    encoder.bitrate = 4_000_000;
+    encoder.low_latency = true;
+    encoder.speed_settings.rdo_lookahead_frames = 1;
+    encoder.speed_settings.scene_detection_mode = SceneDetectionSpeed::None;
+    encoder.max_key_frame_interval = FPS as u64 * 2;
+    Config::new()
+        .with_encoder_config(encoder)
+        .with_threads(0)
+        .new_context()
+        .context("create AV1 encoder")
+}
+
+fn copy_bgra(source: &RawFrame, target: &mut rav1e::prelude::Frame<u8>) -> Result<()> {
+    let (y, u, v) = scale_bgra_to_i420(
+        &source.bgra,
+        source.width,
+        source.height,
+        source.stride,
+        STREAM_WIDTH,
+        STREAM_HEIGHT,
+    )?;
+    target.planes[0].copy_from_raw_u8(&y, STREAM_WIDTH, 1);
+    target.planes[1].copy_from_raw_u8(&u, STREAM_WIDTH / 2, 1);
+    target.planes[2].copy_from_raw_u8(&v, STREAM_WIDTH / 2, 1);
+    Ok(())
+}
+
+fn scale_bgra_to_i420(
+    source: &[u8],
+    source_width: usize,
+    source_height: usize,
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    if source_width == 0
+        || source_height == 0
+        || !width.is_multiple_of(2)
+        || !height.is_multiple_of(2)
+        || stride < source_width
+        || source.len() < ((source_height - 1) * stride + source_width) * 4
+    {
+        bail!("capture returned an invalid BGRA frame");
+    }
+    let (scaled_width, scaled_height) = if width * source_height <= height * source_width {
+        (width, (source_height * width / source_width).max(2) & !1)
+    } else {
+        ((source_width * height / source_height).max(2) & !1, height)
+    };
+    let left = (width - scaled_width) / 2;
+    let top = (height - scaled_height) / 2;
+    let x = (0..width)
+        .map(|column| {
+            (column >= left && column < left + scaled_width)
+                .then(|| (column - left) * source_width / scaled_width)
+        })
+        .collect::<Vec<_>>();
+    let y_map = (0..height)
+        .map(|row| {
+            (row >= top && row < top + scaled_height)
+                .then(|| (row - top) * source_height / scaled_height)
+        })
+        .collect::<Vec<_>>();
+
+    let mut y = vec![16; width * height];
+    let mut u = vec![128; width * height / 4];
+    let mut v = vec![128; width * height / 4];
+
+    for row in (0..height).step_by(2) {
+        for column in (0..width).step_by(2) {
+            let mut red = 0;
+            let mut green = 0;
+            let mut blue = 0;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (r, g, b) = match (x[column + dx], y_map[row + dy]) {
+                        (Some(source_x), Some(source_y)) => {
+                            let pixel = (source_y * stride + source_x) * 4;
+                            (
+                                source[pixel + 2] as i32,
+                                source[pixel + 1] as i32,
+                                source[pixel] as i32,
+                            )
+                        }
+                        _ => (0, 0, 0),
+                    };
+                    y[(row + dy) * width + column + dx] =
+                        clamp((47 * r + 157 * g + 16 * b + 128) / 256 + 16);
+                    red += r;
+                    green += g;
+                    blue += b;
+                }
+            }
+            let r = red / 4;
+            let g = green / 4;
+            let b = blue / 4;
+            let chroma = row / 2 * (width / 2) + column / 2;
+            u[chroma] = clamp((-26 * r - 87 * g + 112 * b + 128) / 256 + 128);
+            v[chroma] = clamp((112 * r - 102 * g - 10 * b + 128) / 256 + 128);
+        }
+    }
+    Ok((y, u, v))
+}
+
+fn clamp(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_black_and_white_bgra() {
+        let black = scale_bgra_to_i420(
+            &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+            2,
+            2,
+            2,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(black, (vec![16; 4], vec![128], vec![128]));
+
+        let white = scale_bgra_to_i420(&[255; 16], 2, 2, 2, 2, 2).unwrap();
+        assert_eq!(white, (vec![235; 4], vec![128], vec![128]));
+    }
+
+    #[test]
+    fn crops_an_odd_source_width_without_losing_stride() {
+        let mut source = Vec::new();
+        for _ in 0..2 {
+            source.extend_from_slice(&[255; 12]);
+        }
+        let converted = scale_bgra_to_i420(&source, 3, 2, 3, 2, 2).unwrap();
+        assert_eq!(converted, (vec![235; 4], vec![128], vec![128]));
+    }
+}
