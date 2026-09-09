@@ -4,7 +4,22 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import './index.css'
 
 type Settings = { password: string; address: string }
+type StreamSettings = { resolution: number; bitrate: number; host_cursor_visible: boolean }
 const ADMIN_TOKEN = 'beam_admin_token'
+const STREAM_SETTINGS = 'beam_stream_settings'
+
+function loadStreamSettings(): Partial<StreamSettings> {
+  try {
+    const value = JSON.parse(localStorage.getItem(STREAM_SETTINGS) || '{}') as Partial<StreamSettings>
+    return {
+      ...(value.resolution && [0.25, 0.5, 0.75, 1].includes(value.resolution) ? { resolution: value.resolution } : {}),
+      ...(value.bitrate && value.bitrate >= 1_000_000 && value.bitrate <= 200_000_000 ? { bitrate: value.bitrate } : {}),
+      ...(typeof value.host_cursor_visible === 'boolean' ? { host_cursor_visible: value.host_cursor_visible } : {}),
+    }
+  } catch {
+    return {}
+  }
+}
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) {
@@ -46,6 +61,8 @@ function Viewer() {
   const settingsReady = useRef(false)
   const reconnecting = useRef(false)
   const keyboardCleanup = useRef<(() => void) | null>(null)
+  const rememberedSettings = useRef(loadStreamSettings())
+  const hostSettings = useRef<StreamSettings | null>(null)
   const [password, setPassword] = useState('')
   const [status, setStatus] = useState('Ready')
   const [fullscreen, setFullscreen] = useState(false)
@@ -115,7 +132,19 @@ function Viewer() {
             type?: string; resolution?: number; bitrate?: number; host_cursor_visible?: boolean
           }
           if (message.type !== 'streamSettings' || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
-          const changed = settingsReady.current
+          const changed = settingsReady.current && hostSettings.current != null && (
+            hostSettings.current.resolution !== message.resolution ||
+            hostSettings.current.bitrate !== message.bitrate ||
+            hostSettings.current.host_cursor_visible !== message.host_cursor_visible
+          )
+          const nextSettings = {
+            resolution: message.resolution,
+            bitrate: message.bitrate,
+            host_cursor_visible: message.host_cursor_visible,
+          }
+          hostSettings.current = nextSettings
+          rememberedSettings.current = nextSettings
+          localStorage.setItem(STREAM_SETTINGS, JSON.stringify(nextSettings))
           setResolution(message.resolution)
           setBitrate(message.bitrate)
           setHostMouseVisible(message.host_cursor_visible)
@@ -133,17 +162,26 @@ function Viewer() {
           // Ignore non-control messages.
         }
       }
-      const streamHasFocus = () => document.fullscreenElement === player.current || document.activeElement === video.current
+      input.onopen = () => {
+        const settings = rememberedSettings.current
+        if (settings.resolution == null && settings.bitrate == null && settings.host_cursor_visible == null) return
+        input.send(JSON.stringify({
+          type: 'setStreamSettings',
+          resolution: settings.resolution ?? 1,
+          bitrate: settings.bitrate ?? 40_000_000,
+          host_cursor_visible: settings.host_cursor_visible ?? true,
+        }))
+      }
       const sendMouseButton = (event: PointerEvent, down: boolean) => {
         if (event.pointerType !== 'mouse' || input.readyState !== 'open') return
         video.current?.focus()
-        if (!streamHasFocus()) return
+        if (document.fullscreenElement !== player.current) return
         event.preventDefault()
         if ([0, 1, 2].includes(event.button))
           input.send(JSON.stringify({ type: 'mouseButton', button: event.button, down }))
       }
       const sendKey = (type: 'keyDown' | 'keyUp', event: KeyboardEvent) => {
-        if (!streamHasFocus() || event.isComposing || input.readyState !== 'open') return
+        if (document.fullscreenElement !== player.current || event.isComposing || input.readyState !== 'open') return
         event.preventDefault()
         input.send(JSON.stringify({ type, code: event.code, key: event.key }))
       }
@@ -174,11 +212,13 @@ function Viewer() {
           }
           video.current.onpointermove = event => {
             if (event.pointerType && event.pointerType !== 'mouse') return
+            if (document.fullscreenElement !== player.current) return
             const position = streamPosition(video.current!, event.clientX, event.clientY)
             if (position && input.readyState === 'open')
               input.send(JSON.stringify({ type: 'mouseMove', ...position }))
           }
           video.current.onwheel = event => {
+            if (document.fullscreenElement !== player.current) return
             event.preventDefault()
             if (input.readyState === 'open')
               input.send(JSON.stringify({
@@ -187,6 +227,7 @@ function Viewer() {
           }
           video.current.onpointerdown = event => sendMouseButton(event, true)
           video.current.onpointerup = event => sendMouseButton(event, false)
+          video.current.oncontextmenu = event => event.preventDefault()
         }
       }
       pc.onconnectionstatechange = () => {
@@ -224,9 +265,10 @@ function Viewer() {
   return (
     <Shell>
       <section ref={player} style={{ cursor: clientMouseVisible ? 'default' : 'none' }} className="relative overflow-hidden border border-white/10 bg-black shadow-2xl shadow-cyan-950/20">
-        <video ref={video} tabIndex={0} controls={false} autoPlay playsInline onClick={() => {
+        <video ref={video} tabIndex={0} controls={false} autoPlay playsInline onContextMenu={event => event.preventDefault()} onClick={() => {
           video.current?.focus()
           void video.current?.play()
+          if (!document.fullscreenElement) void toggleFullscreen()
         }}
           style={{ aspectRatio: streamAspect }} className="w-full bg-black object-contain" />
         {!fullscreen && <button type="button" onClick={() => void toggleFullscreen()}
@@ -258,7 +300,7 @@ function Viewer() {
           <select value={bitrate / 1_000_000}
             onChange={event => sendStreamSettings({ bitrate: Number(event.target.value) * 1_000_000 })}
             className="rounded-lg border border-white/10 bg-slate-900 px-2 py-2">
-            {Array.from({ length: 100 }, (_, index) => index + 1).map(value => <option key={value} value={value}>{value} Mbps</option>)}
+            {[1, 5, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100, 150, 200].map(value => <option key={value} value={value}>{value} Mbps</option>)}
           </select>
         </label>
       </section>}

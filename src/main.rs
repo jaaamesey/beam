@@ -30,11 +30,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket},
-    sync::{
+        sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+        },
+        path::PathBuf,
+        time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -102,7 +103,9 @@ fn main() -> Result<()> {
         network_address,
     });
 
-    let files = ServeDir::new("web/dist").not_found_service(ServeFile::new("web/dist/index.html"));
+    let web_root = resource_path("web/dist");
+    let files = ServeDir::new(&web_root)
+        .not_found_service(ServeFile::new(web_root.join("index.html")));
     let secure = Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", post(login))
@@ -123,6 +126,19 @@ fn main() -> Result<()> {
         }
     }
     tray::run(settings_url, shutdown_flag, input_rx)
+}
+
+fn resource_path(relative: &str) -> PathBuf {
+    let development = PathBuf::from(relative);
+    if development.exists() {
+        return development;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .and_then(|macos| macos.parent().map(PathBuf::from))
+        .map(|contents| contents.join("Resources").join(relative))
+        .unwrap_or_else(|| PathBuf::from(relative))
 }
 
 async fn run_server(listener: TcpListener, tls: TlsAcceptor, secure: Router, welcome: Router) {

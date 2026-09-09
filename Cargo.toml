@@ -6,6 +6,12 @@ edition = "2024"
 [profile.dev]
 opt-level = 2
 
+[package.metadata.bundle]
+name = "Beam"
+identifier = "com.beam.streaming"
+category = "public.app-category.utilities"
+resources = ["web/dist"]
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["json"] }

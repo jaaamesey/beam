@@ -153,7 +153,7 @@ impl Media {
                         {
                             let next = crate::capture::StreamSettings {
                                 resolution: resolution.clamp(0.25, 1.0),
-                                bitrate: bitrate.clamp(1_000_000, 100_000_000),
+                                bitrate: bitrate.clamp(1_000_000, 200_000_000),
                                 host_cursor_visible,
                             };
                             *settings.write().await = next;

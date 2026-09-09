@@ -40,7 +40,7 @@ pub struct StreamSettings {
 
 impl Default for StreamSettings {
     fn default() -> Self {
-        Self { resolution: 1.0, bitrate: 8_000_000, host_cursor_visible: true }
+        Self { resolution: 1.0, bitrate: 40_000_000, host_cursor_visible: true }
     }
 }
 
