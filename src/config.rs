@@ -39,6 +39,19 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn settings_opened() -> Result<bool> {
+        Ok(settings_marker()?.exists())
+    }
+
+    pub fn mark_settings_opened() -> Result<()> {
+        let marker = settings_marker()?;
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(marker, b"opened")?;
+        Ok(())
+    }
 }
 
 fn admin_token() -> String {
@@ -48,7 +61,13 @@ fn admin_token() -> String {
 }
 
 fn path() -> Result<PathBuf> {
-    Ok(dirs::config_dir()
-        .context("no config directory")?
-        .join("beam/config.json"))
+    Ok(config_directory()?.join("beam/config.json"))
+}
+
+fn settings_marker() -> Result<PathBuf> {
+    Ok(config_directory()?.join("beam/settings-opened"))
+}
+
+fn config_directory() -> Result<PathBuf> {
+    Ok(dirs::config_dir().context("no config directory")?)
 }

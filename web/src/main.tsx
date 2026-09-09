@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import './index.css'
 
-type Settings = { password: string }
+type Settings = { password: string; address: string }
 const ADMIN_TOKEN = 'beam_admin_token'
 
 class HttpError extends Error {
@@ -13,10 +13,12 @@ class HttpError extends Error {
 }
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  headers.set('content-type', 'application/json')
   const response = await fetch(path, {
-    credentials: 'same-origin',
-    headers: { 'content-type': 'application/json', ...init?.headers },
     ...init,
+    credentials: 'same-origin',
+    headers,
   })
   if (!response.ok) throw new HttpError(response.status, (await response.text()) || response.statusText)
   return response.json()
@@ -101,6 +103,7 @@ function SettingsPage() {
   const [token] = useState(() => location.hash.slice(1) || localStorage.getItem(ADMIN_TOKEN) || '')
   const [authorized, setAuthorized] = useState<boolean | null>(null)
   const [password, setPassword] = useState('')
+  const [address, setAddress] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [status, setStatus] = useState('Loading…')
@@ -115,8 +118,12 @@ function SettingsPage() {
       .then(value => {
         localStorage.setItem(ADMIN_TOKEN, token)
         setPassword(value.password)
+        setAddress(value.address)
         setStatus('Saved on this Mac')
         setAuthorized(true)
+        return json('/api/admin/settings-opened', {
+          method: 'POST', headers: { authorization: `Bearer ${token}` },
+        })
       })
       .catch(error => {
         if (error instanceof HttpError && [401, 403].includes(error.status)) {
@@ -174,12 +181,14 @@ function SettingsPage() {
       <section className="max-w-xl rounded-3xl border border-white/10 bg-white/[.04] p-7 shadow-2xl">
         <p className="mb-2 text-xs font-semibold uppercase tracking-[.2em] text-cyan-300">Host settings</p>
         <h1 className="text-3xl font-semibold tracking-tight">Who can connect?</h1>
-        <p className="mt-3 text-sm leading-6 text-slate-400">This page can change settings only when opened on the host Mac.</p>
+        <p className="mt-4 rounded-xl bg-black/20 px-4 py-3 text-sm text-slate-300">
+          Devices on your network can connect to this computer at <a className="font-mono text-cyan-300 hover:underline" href={address}>{address}</a>
+        </p>
         <form onSubmit={save} className="mt-8">
           <label className="mb-2 block text-sm font-medium" htmlFor="password">Client password</label>
           <div className="relative">
             <input id="password" type={showPassword ? 'text' : 'password'} value={password}
-              onChange={e => setPassword(e.target.value)} minLength={12} required
+              onChange={e => setPassword(e.target.value)} minLength={4} required
               className="w-full rounded-xl border border-white/10 bg-black/30 py-3 pl-4 pr-12 font-mono outline-none focus:border-cyan-300/60" />
             <button type="button" onClick={() => setShowPassword(value => !value)}
               aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword}

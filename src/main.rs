@@ -27,7 +27,7 @@ use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{SocketAddr, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -46,7 +46,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-const ADDRESS: &str = "0.0.0.0:9470";
+const PORT: u16 = 9470;
 const COOKIE: &str = "beam_session";
 type HttpResult<T> = Result<T, (StatusCode, String)>;
 
@@ -55,11 +55,18 @@ struct App {
     sessions: RwLock<HashMap<String, Instant>>,
     media: Arc<rtc::Media>,
     shutdown: Arc<AtomicBool>,
+    network_address: String,
 }
 
 #[derive(Deserialize, Serialize)]
 struct Password {
     password: String,
+}
+
+#[derive(Serialize)]
+struct Settings {
+    password: String,
+    address: String,
 }
 
 #[derive(Deserialize)]
@@ -75,15 +82,19 @@ fn main() -> Result<()> {
         .init();
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let listener = runtime.block_on(TcpListener::bind(ADDRESS))?;
+    let listener = runtime.block_on(TcpListener::bind(("0.0.0.0", PORT)))?;
+    let bound_address = listener.local_addr()?;
     let config = Config::load()?;
-    let settings_url = format!("https://127.0.0.1:9470/settings#{}", config.admin_token);
+    let network_address = format!("http://{}:{PORT}", local_ip());
+    let open_settings = !Config::settings_opened()?;
+    let settings_url = format!("https://127.0.0.1:{PORT}/settings#{}", config.admin_token);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
         media: rtc::Media::new()?,
         shutdown: shutdown_flag.clone(),
+        network_address,
     });
 
     let files = ServeDir::new("web/dist").not_found_service(ServeFile::new("web/dist/index.html"));
@@ -92,6 +103,7 @@ fn main() -> Result<()> {
         .route("/api/session", post(login))
         .route("/api/offer", post(offer))
         .route("/api/admin/settings", get(get_settings).put(put_settings))
+        .route("/api/admin/settings-opened", post(settings_opened))
         .route("/api/admin/shutdown", post(shutdown))
         .fallback_service(files)
         .layer(TraceLayer::new_for_http())
@@ -99,9 +111,11 @@ fn main() -> Result<()> {
     let welcome = Router::new().fallback(welcome);
     let tls = tls::acceptor()?;
     runtime.spawn(run_server(listener, tls, secure, welcome));
-    tracing::info!(address = ADDRESS, "Beam is ready");
-    if let Err(error) = open::that(&settings_url) {
-        tracing::warn!(%error, "could not open settings in the browser");
+    tracing::info!(address = %bound_address, "Beam is ready");
+    if open_settings {
+        if let Err(error) = open::that(&settings_url) {
+            tracing::warn!(%error, "could not open settings in the browser");
+        }
     }
     tray::run(settings_url, shutdown_flag)
 }
@@ -233,10 +247,11 @@ async fn get_settings(
     State(app): State<Arc<App>>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> HttpResult<Json<Password>> {
+) -> HttpResult<Json<Settings>> {
     require_admin(&app, address, &headers).await?;
-    Ok(Json(Password {
+    Ok(Json(Settings {
         password: app.config.read().await.password.clone(),
+        address: app.network_address.clone(),
     }))
 }
 
@@ -247,10 +262,10 @@ async fn put_settings(
     Json(input): Json<Password>,
 ) -> HttpResult<Json<serde_json::Value>> {
     require_admin(&app, address, &headers).await?;
-    if input.password.len() < 12 {
+    if input.password.len() < 4 {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Password must be at least 12 characters".into(),
+            "Password must be at least 4 characters".into(),
         ));
     }
     let config = Config {
@@ -277,6 +292,16 @@ async fn shutdown(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn settings_opened(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<serde_json::Value>> {
+    require_admin(&app, address, &headers).await?;
+    Config::mark_settings_opened().map_err(internal)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 async fn require_admin(app: &App, address: SocketAddr, headers: &HeaderMap) -> HttpResult<()> {
     require_loopback(address)?;
     let token = headers
@@ -298,6 +323,16 @@ fn require_loopback(address: SocketAddr) -> HttpResult<()> {
         StatusCode::FORBIDDEN,
         "Host settings are available only on this machine".into(),
     ))
+}
+
+fn local_ip() -> std::net::IpAddr {
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:80")?;
+            socket.local_addr()
+        })
+        .map(|address| address.ip())
+        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap())
 }
 
 async fn require_session(app: &App, headers: &HeaderMap) -> HttpResult<()> {
