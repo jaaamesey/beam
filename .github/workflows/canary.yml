@@ -82,7 +82,7 @@ jobs:
       - run: pnpm --dir web install --frozen-lockfile
       - run: pnpm --dir web build
       - run: cargo install cargo-bundle --version 0.11.0 --locked
-      - run: cargo bundle --release --locked
+      - run: cargo bundle --release
       - uses: actions/upload-artifact@v4
         with:
           name: beam-macos-arm64
