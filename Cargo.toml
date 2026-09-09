@@ -12,6 +12,8 @@ axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 bytes = "1"
 dirs = "6"
+display-info = "0.5"
+enigo = { version = "0.2", features = ["wayland", "libei"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 open = "5"
 rand = "0.9"
@@ -33,3 +35,4 @@ webrtc = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cidre = { version = "0.11", default-features = false, features = ["cf", "cm", "cv", "vt"] }
+macos-accessibility-client = "0.0.2"

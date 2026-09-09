@@ -53,6 +53,7 @@ function Viewer() {
       peer.current?.close()
       peer.current = pc
       pc.addTransceiver('video', { direction: 'recvonly' })
+      const input = pc.createDataChannel('input')
       pc.ontrack = ({ receiver, streams: [stream] }) => {
         const lowLatency = receiver as RTCRtpReceiver & {
           jitterBufferTarget?: number
@@ -64,7 +65,22 @@ function Viewer() {
         } catch {
           // These latency hints are not implemented by every browser.
         }
-        if (video.current) video.current.srcObject = stream
+        if (video.current) {
+          video.current.srcObject = stream
+          video.current.onpointermove = event => {
+            if (event.pointerType && event.pointerType !== 'mouse') return
+            const position = streamPosition(video.current!, event.clientX, event.clientY)
+            if (position && input.readyState === 'open')
+              input.send(JSON.stringify({ type: 'mouseMove', ...position }))
+          }
+          video.current.onwheel = event => {
+            event.preventDefault()
+            if (input.readyState === 'open')
+              input.send(JSON.stringify({
+                type: 'wheel', deltaX: event.deltaX, deltaY: event.deltaY, deltaMode: event.deltaMode,
+              }))
+          }
+        }
       }
       pc.onconnectionstatechange = () => {
         setStatus(pc.connectionState)
@@ -225,6 +241,20 @@ function waitForIce(pc: RTCPeerConnection) {
     }
     pc.addEventListener('icegatheringstatechange', listener)
   })
+}
+
+function streamPosition(video: HTMLVideoElement, clientX: number, clientY: number) {
+  const rect = video.getBoundingClientRect()
+  const streamAspect = 16 / 9
+  const contentAspect = rect.width / rect.height
+  const contentWidth = contentAspect > streamAspect ? rect.height * streamAspect : rect.width
+  const contentHeight = contentAspect > streamAspect ? rect.height : rect.width / streamAspect
+  const left = rect.left + (rect.width - contentWidth) / 2
+  const top = rect.top + (rect.height - contentHeight) / 2
+  const x = (clientX - left) / contentWidth
+  const y = (clientY - top) / contentHeight
+  if (x < 0 || x > 1 || y < 0 || y > 1) return null
+  return { x, y }
 }
 
 createRoot(document.getElementById('root')!).render(

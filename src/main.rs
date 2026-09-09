@@ -5,6 +5,7 @@
 
 mod capture;
 mod config;
+mod input;
 mod rtc;
 mod tls;
 mod tray;
@@ -80,6 +81,8 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::from_default_env().add_directive("beam=info".parse()?),
         )
         .init();
+
+    input::check_permissions();
 
     let runtime = tokio::runtime::Runtime::new()?;
     let listener = runtime.block_on(TcpListener::bind(("0.0.0.0", PORT)))?;

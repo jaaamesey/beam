@@ -9,6 +9,7 @@ use webrtc::{
         media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MediaEngine},
     },
     interceptor::registry::Registry,
+    data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage},
     media::Sample,
     peer_connection::{
         RTCPeerConnection, configuration::RTCConfiguration,
@@ -75,6 +76,25 @@ impl Media {
                 .new_peer_connection(RTCConfiguration::default())
                 .await?,
         );
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("beam-input".into())
+            .spawn(move || crate::input::run(input_rx))?;
+        peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
+            let input_tx = input_tx.clone();
+            Box::pin(async move {
+                if channel.label() != "input" {
+                    return;
+                }
+                tracing::info!("input data channel connected");
+                channel.on_message(Box::new(move |message: DataChannelMessage| {
+                    let input_tx = input_tx.clone();
+                    Box::pin(async move {
+                        let _ = input_tx.send(message.data.to_vec());
+                    })
+                }));
+            })
+        }));
         let track = Arc::new(TrackLocalStaticSample::new(
             self.capability.clone(),
             "desktop".into(),
