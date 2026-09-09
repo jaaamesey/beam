@@ -6,7 +6,7 @@ use webrtc::{
     api::{
         APIBuilder,
         interceptor_registry::register_default_interceptors,
-        media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MediaEngine},
+        media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine},
     },
     interceptor::registry::Registry,
     data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage},
@@ -25,10 +25,11 @@ use crate::capture::{self, CODEC, Codec};
 pub struct Media {
     api: webrtc::api::API,
     capability: RTCRtpCodecCapability,
+    input_tx: std::sync::mpsc::Sender<Vec<u8>>,
 }
 
 impl Media {
-    pub fn new() -> Result<Arc<Self>> {
+    pub fn new(input_tx: std::sync::mpsc::Sender<Vec<u8>>) -> Result<Arc<Self>> {
         let mut engine = MediaEngine::default();
         let (capability, payload_type) = match CODEC {
             Codec::Av1 => (
@@ -59,6 +60,19 @@ impl Media {
             },
             RTPCodecType::Video,
         )?;
+        engine.register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_OPUS.to_owned(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    ..Default::default()
+                },
+                payload_type: 111,
+                ..Default::default()
+            },
+            RTPCodecType::Audio,
+        )?;
         let registry = register_default_interceptors(Registry::new(), &mut engine)?;
         let media = Arc::new(Self {
             api: APIBuilder::new()
@@ -66,6 +80,7 @@ impl Media {
                 .with_interceptor_registry(registry)
                 .build(),
             capability,
+            input_tx,
         });
         Ok(media)
     }
@@ -76,10 +91,7 @@ impl Media {
                 .new_peer_connection(RTCConfiguration::default())
                 .await?,
         );
-        let (input_tx, input_rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("beam-input".into())
-            .spawn(move || crate::input::run(input_rx))?;
+        let input_tx = self.input_tx.clone();
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_tx = input_tx.clone();
             Box::pin(async move {
@@ -100,12 +112,29 @@ impl Media {
             "desktop".into(),
             "beam".into(),
         ));
+        let audio_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_owned(),
+                clock_rate: 48_000,
+                channels: 2,
+                ..Default::default()
+            },
+            "audio".into(),
+            "beam".into(),
+        ));
         let sender = peer
             .add_track(track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+            .await?;
+        let audio_sender = peer
+            .add_track(audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
             .await?;
         tokio::spawn(async move {
             let mut buffer = vec![0; 1500];
             while sender.read(&mut buffer).await.is_ok() {}
+        });
+        tokio::spawn(async move {
+            let mut buffer = vec![0; 1500];
+            while audio_sender.read(&mut buffer).await.is_ok() {}
         });
         peer.set_remote_description(RTCSessionDescription::offer(sdp)?)
             .await?;
@@ -117,12 +146,16 @@ impl Media {
             .local_description()
             .await
             .context("missing local description")?;
-        tokio::spawn(run_session(peer, track));
+        tokio::spawn(run_session(peer, track, audio_track));
         Ok(answer)
     }
 }
 
-async fn run_session(peer: Arc<RTCPeerConnection>, track: Arc<TrackLocalStaticSample>) {
+async fn run_session(
+    peer: Arc<RTCPeerConnection>,
+    track: Arc<TrackLocalStaticSample>,
+    audio_track: Arc<TrackLocalStaticSample>,
+) {
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
         while matches!(
             peer.connection_state(),
@@ -140,7 +173,9 @@ async fn run_session(peer: Arc<RTCPeerConnection>, track: Arc<TrackLocalStaticSa
     }
 
     let (frames_tx, mut frames_rx) = mpsc::channel(1);
-    let (capture, mut capture_errors) = capture::spawn(frames_tx);
+    let (audio_tx, mut audio_rx) = mpsc::channel(8);
+    let (audio, audio_frames_tx) = crate::audio::spawn(audio_tx);
+    let (capture, mut capture_errors) = capture::spawn(frames_tx, audio_frames_tx);
     loop {
         tokio::select! {
             error = capture_errors.recv() => {
@@ -160,6 +195,17 @@ async fn run_session(peer: Arc<RTCPeerConnection>, track: Arc<TrackLocalStaticSa
                     break;
                 }
             }
+            frame = audio_rx.recv() => {
+                let Some((data, duration)) = frame else { break };
+                if let Err(error) = audio_track.write_sample(&Sample {
+                    data: data.into(),
+                    duration,
+                    ..Default::default()
+                }).await {
+                    tracing::warn!(%error, "failed to send audio frame");
+                    break;
+                }
+            }
             () = tokio::time::sleep(Duration::from_millis(100)) => {
                 if peer.connection_state() != RTCPeerConnectionState::Connected {
                     break;
@@ -168,5 +214,6 @@ async fn run_session(peer: Arc<RTCPeerConnection>, track: Arc<TrackLocalStaticSa
         }
     }
     drop(capture);
+    drop(audio);
     let _ = peer.close().await;
 }

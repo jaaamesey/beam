@@ -5,6 +5,7 @@
 
 mod capture;
 mod config;
+mod audio;
 mod input;
 mod rtc;
 mod tls;
@@ -92,10 +93,11 @@ fn main() -> Result<()> {
     let open_settings = !Config::settings_opened()?;
     let settings_url = format!("https://127.0.0.1:{PORT}/settings#{}", config.admin_token);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
-        media: rtc::Media::new()?,
+        media: rtc::Media::new(input_tx)?,
         shutdown: shutdown_flag.clone(),
         network_address,
     });
@@ -120,7 +122,7 @@ fn main() -> Result<()> {
             tracing::warn!(%error, "could not open settings in the browser");
         }
     }
-    tray::run(settings_url, shutdown_flag)
+    tray::run(settings_url, shutdown_flag, input_rx)
 }
 
 async fn run_server(listener: TcpListener, tls: TlsAcceptor, secure: Router, welcome: Router) {

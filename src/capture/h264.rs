@@ -1,7 +1,7 @@
-use super::{EncodedFrame, FPS, LatestFrame, RawFrame, STREAM_HEIGHT, STREAM_WIDTH, next_frame};
+use super::{EncodedFrame, FPS, LatestFrame, RawFrame, next_frame};
 use anyhow::{Context as _, Result, bail};
 use cidre::{arc, cf, cm, cv, os, vt};
-use std::{ffi::c_void, slice, sync::mpsc as std_mpsc, time::Duration};
+use std::{ffi::c_void, slice, sync::{Arc, mpsc as std_mpsc}, time::Duration};
 use tokio::sync::mpsc;
 
 const BITRATE: i32 = 8_000_000;
@@ -9,18 +9,25 @@ const START_CODE: &[u8] = &[0, 0, 0, 1];
 
 struct Callback(std_mpsc::Sender<Result<Vec<u8>>>);
 
-pub fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result<()> {
+pub fn encode(
+    frames: LatestFrame,
+    sender: mpsc::Sender<EncodedFrame>,
+    first: Arc<RawFrame>,
+    width: usize,
+    height: usize,
+) -> Result<()> {
     let (encoded_tx, encoded_rx) = std_mpsc::channel();
     let mut callback = Box::new(Callback(encoded_tx));
-    let encoder = create_encoder(&mut callback)?;
+    let encoder = create_encoder(&mut callback, width, height)?;
     let mut pixel_buffer =
-        cv::PixelBuf::new(STREAM_WIDTH, STREAM_HEIGHT, cv::PixelFormat::_32_BGRA, None)
+        cv::PixelBuf::new(width, height, cv::PixelFormat::_32_BGRA, None)
             .context("create H.264 input buffer")?;
 
     let mut frame_number = 0;
     let mut previous_time = None;
-    while let Some(source) = next_frame(&frames) {
-        copy_bgra(&source, &mut pixel_buffer)?;
+    let mut source = Some(first);
+    while let Some(source) = source.take().or_else(|| next_frame(&frames)) {
+        copy_bgra(&source, &mut pixel_buffer, width, height)?;
         encoder
             .encode_frame(
                 &pixel_buffer,
@@ -50,10 +57,14 @@ pub fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result
     Ok(())
 }
 
-fn create_encoder(callback: &mut Callback) -> Result<arc::R<vt::CompressionSession>> {
+fn create_encoder(
+    callback: &mut Callback,
+    width: usize,
+    height: usize,
+) -> Result<arc::R<vt::CompressionSession>> {
     let mut encoder = vt::CompressionSession::new(
-        STREAM_WIDTH as u32,
-        STREAM_HEIGHT as u32,
+        width as u32,
+        height as u32,
         cm::VideoCodec::H264,
         None,
         None,
@@ -117,7 +128,7 @@ fn configure(encoder: &mut vt::CompressionSession) -> Result<()> {
     Ok(())
 }
 
-fn copy_bgra(source: &RawFrame, target: &mut cv::PixelBuf) -> Result<()> {
+fn copy_bgra(source: &RawFrame, target: &mut cv::PixelBuf, width: usize, height: usize) -> Result<()> {
     let target_pointer = std::ptr::from_mut(target);
     let _lock = target.base_address_lock(cv::pixel_buffer::LockFlags::DEFAULT)?;
     let stride = unsafe { CVPixelBufferGetBytesPerRow(&*target_pointer) };
@@ -125,21 +136,21 @@ fn copy_bgra(source: &RawFrame, target: &mut cv::PixelBuf) -> Result<()> {
     if pointer.is_null() {
         bail!("H.264 input buffer has no address");
     }
-    let data = unsafe { slice::from_raw_parts_mut(pointer, stride * STREAM_HEIGHT) };
+    let data = unsafe { slice::from_raw_parts_mut(pointer, stride * height) };
     data.fill(0);
 
-    let (width, height) = if STREAM_WIDTH * source.height <= STREAM_HEIGHT * source.width {
-        (STREAM_WIDTH, source.height * STREAM_WIDTH / source.width)
+    let (scaled_width, scaled_height) = if width * source.height <= height * source.width {
+        (width, source.height * width / source.width)
     } else {
-        (source.width * STREAM_HEIGHT / source.height, STREAM_HEIGHT)
+        (source.width * height / source.height, height)
     };
-    let left = (STREAM_WIDTH - width) / 2;
-    let top = (STREAM_HEIGHT - height) / 2;
-    for y in 0..height {
-        let source_y = y * source.height / height;
-        for x in 0..width {
-            let source_x = x * source.width / width;
-            let from = (source_y * source.stride + source_x) * 4;
+    let left = (width - scaled_width) / 2;
+    let top = (height - scaled_height) / 2;
+    for y in 0..scaled_height {
+        let source_y = y * source.height / scaled_height;
+        for x in 0..scaled_width {
+            let source_x = x * source.width / scaled_width;
+            let from = source_y * source.stride + source_x * 4;
             let to = (top + y) * stride + (left + x) * 4;
             data[to..to + 4].copy_from_slice(&source.bgra[from..from + 4]);
         }
@@ -243,11 +254,12 @@ mod tests {
     #[test]
     #[ignore = "requires macOS video encoder hardware"]
     fn encodes_hardware_frame() {
+        let (width, height) = (super::STREAM_WIDTH, super::STREAM_HEIGHT);
         let (sender, receiver) = std_mpsc::channel();
         let mut callback = Callback(sender);
-        let encoder = create_encoder(&mut callback).unwrap();
+        let encoder = create_encoder(&mut callback, width, height).unwrap();
         let pixel_buffer =
-            cv::PixelBuf::new(STREAM_WIDTH, STREAM_HEIGHT, cv::PixelFormat::_32_BGRA, None)
+            cv::PixelBuf::new(width, height, cv::PixelFormat::_32_BGRA, None)
                 .unwrap();
         encoder
             .encode_frame(

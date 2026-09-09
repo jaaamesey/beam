@@ -1,9 +1,6 @@
 use anyhow::{Context as _, Result, bail};
 use rav1e::prelude::*;
-use scap::{
-    capturer::{Capturer, Options, Resolution},
-    frame::{Frame, FrameType, VideoFrame},
-};
+use pinray::{AudioCapture, AudioFrame, CaptureEvent, CaptureSession, FrameData, SourceId, VideoCaptureTarget};
 use std::{
     sync::{
         Arc, Condvar, Mutex,
@@ -28,6 +25,7 @@ pub const CODEC: Codec = Codec::H264;
 pub const FPS: u32 = 30;
 // AV1 4:2:0 requires both stream dimensions to be even.
 pub const STREAM_WIDTH: usize = 1920;
+#[allow(dead_code)]
 pub const STREAM_HEIGHT: usize = 1080;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -64,7 +62,10 @@ impl Drop for Session {
     }
 }
 
-pub fn spawn(sender: mpsc::Sender<EncodedFrame>) -> (Session, mpsc::Receiver<String>) {
+pub fn spawn(
+    sender: mpsc::Sender<EncodedFrame>,
+    audio_sender: mpsc::Sender<AudioFrame>,
+) -> (Session, mpsc::Receiver<String>) {
     let latest = Arc::new((
         Mutex::new(FrameSlot {
             frame: None,
@@ -81,7 +82,7 @@ pub fn spawn(sender: mpsc::Sender<EncodedFrame>) -> (Session, mpsc::Receiver<Str
     std::thread::Builder::new()
         .name("beam-capture".into())
         .spawn(move || {
-            if let Err(error) = capture_inner(capture_frames.clone(), capture_stop) {
+            if let Err(error) = capture_inner(capture_frames.clone(), capture_stop, audio_sender) {
                 tracing::error!(error = ?error, "capture stopped");
                 let _ = capture_errors.blocking_send(error.to_string());
             }
@@ -107,68 +108,72 @@ pub fn spawn(sender: mpsc::Sender<EncodedFrame>) -> (Session, mpsc::Receiver<Str
     )
 }
 
-fn capture_inner(latest: LatestFrame, stop: Arc<AtomicBool>) -> Result<()> {
-    if !scap::is_supported() {
-        bail!("screen capture is unsupported on this platform");
-    }
-    if !scap::has_permission() && !scap::request_permission() {
-        bail!("Screen Recording permission was not granted");
-    }
-
-    // sc-cap 0.2.0's macOS NV12 conversion incorrectly copies plane 0 twice.
-    // BGRA is correct and keeps that dependency bug outside our media pipeline.
-    let mut capturer = Capturer::build(Options {
-        fps: FPS,
-        show_cursor: true,
-        output_type: FrameType::BGRAFrame,
-        output_resolution: Resolution::Captured,
-        ..Default::default()
-    })
-    .map_err(|error| anyhow::anyhow!(error))?;
-    capturer.start_capture();
+fn capture_inner(
+    latest: LatestFrame,
+    stop: Arc<AtomicBool>,
+    audio_sender: mpsc::Sender<AudioFrame>,
+) -> Result<()> {
+    let mut capturer = CaptureSession::builder()
+        .video_target(VideoCaptureTarget::Display(SourceId::new("auto")))
+        .audio(AudioCapture::SystemMix)
+        .frame_rate(Some(FPS))
+        .build()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    capturer.start().map_err(|error| anyhow::anyhow!(error))?;
 
     let mut last_frame = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let Some(frame) = capturer
-            .try_get_next_frame()
-            .context("read screen capture frame")?
-        else {
-            if last_frame.elapsed() >= CAPTURE_TIMEOUT {
+        let event = capturer
+            .next_event(Some(CAPTURE_TIMEOUT))
+            .map_err(|error| anyhow::anyhow!(error))?;
+        match event {
+            CaptureEvent::Video(frame) => {
+                let FrameData::Host(data) = frame.data else { continue };
+                if frame.width < 2 || frame.height < 2 {
+                    continue;
+                }
+                last_frame = Instant::now();
+                latest.0.lock().unwrap().frame = Some(Arc::new(RawFrame {
+                    bgra: data,
+                    width: frame.width as usize,
+                    height: frame.height as usize,
+                    stride: frame.stride as usize,
+                    captured_at: SystemTime::now(),
+                }));
+                latest.1.notify_one();
+            }
+            CaptureEvent::Audio(frame) => {
+                if audio_sender.blocking_send(frame).is_err() {
+                    break;
+                }
+            }
+            _ if last_frame.elapsed() >= CAPTURE_TIMEOUT => {
                 bail!("screen capture produced no frames for two seconds");
             }
-            std::thread::sleep(Duration::from_millis(5));
-            continue;
-        };
-        if let Frame::Video(VideoFrame::BGRA(frame)) = frame
-            && frame.width >= 2
-            && frame.height >= 2
-        {
-            last_frame = Instant::now();
-            let stride = frame.width as usize;
-            latest.0.lock().unwrap().frame = Some(Arc::new(RawFrame {
-                bgra: frame.data,
-                width: stride,
-                height: frame.height as usize,
-                stride,
-                captured_at: frame.display_time,
-            }));
-            latest.1.notify_one();
+            _ => {}
         }
     }
-    capturer.stop_capture();
+    capturer.stop().map_err(|error| anyhow::anyhow!(error))?;
     Ok(())
 }
 
 fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result<()> {
+    let Some(first) = next_frame(&frames) else { return Ok(()) };
+    let (width, height) = stream_dimensions(first.width, first.height);
     match CODEC {
-        Codec::Av1 => encode_av1(frames, sender),
+        Codec::Av1 => encode_av1(frames, sender, first, width, height),
         Codec::H264 => {
             #[cfg(target_os = "macos")]
-            return h264::encode(frames, sender);
+            return h264::encode(frames, sender, first, width, height);
             #[cfg(not(target_os = "macos"))]
             bail!("H.264 hardware encoding is currently supported only on macOS")
         }
     }
+}
+
+pub fn stream_dimensions(source_width: usize, source_height: usize) -> (usize, usize) {
+    let height = ((STREAM_WIDTH * source_height / source_width).max(2)) & !1;
+    (STREAM_WIDTH, height)
 }
 
 fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
@@ -179,15 +184,20 @@ fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
     slot.frame.take()
 }
 
-fn encode_av1(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result<()> {
-    let mut encoder = new_encoder()?;
+fn encode_av1(
+    frames: LatestFrame,
+    sender: mpsc::Sender<EncodedFrame>,
+    first: Arc<RawFrame>,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let mut encoder = new_encoder(width, height)?;
     let mut previous_time = None;
+    let mut source = Some(first);
     loop {
-        let Some(source) = next_frame(&frames) else {
-            return Ok(());
-        };
+        let Some(source) = source.take().or_else(|| next_frame(&frames)) else { return Ok(()) };
         let mut frame = encoder.new_frame();
-        copy_bgra(&source, &mut frame)?;
+        copy_bgra(&source, &mut frame, width, height)?;
         encoder.send_frame(frame).context("queue AV1 frame")?;
         let duration = previous_time
             .and_then(|time| source.captured_at.duration_since(time).ok())
@@ -209,10 +219,10 @@ fn encode_av1(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result
     }
 }
 
-fn new_encoder() -> Result<Context<u8>> {
+fn new_encoder(width: usize, height: usize) -> Result<Context<u8>> {
     let mut encoder = EncoderConfig::with_speed_preset(10);
-    encoder.width = STREAM_WIDTH;
-    encoder.height = STREAM_HEIGHT;
+    encoder.width = width;
+    encoder.height = height;
     encoder.time_base = Rational::new(1, 1_000);
     encoder.bitrate = 4_000_000;
     encoder.low_latency = true;
@@ -226,18 +236,18 @@ fn new_encoder() -> Result<Context<u8>> {
         .context("create AV1 encoder")
 }
 
-fn copy_bgra(source: &RawFrame, target: &mut rav1e::prelude::Frame<u8>) -> Result<()> {
+fn copy_bgra(source: &RawFrame, target: &mut rav1e::prelude::Frame<u8>, width: usize, height: usize) -> Result<()> {
     let (y, u, v) = scale_bgra_to_i420(
         &source.bgra,
         source.width,
         source.height,
         source.stride,
-        STREAM_WIDTH,
-        STREAM_HEIGHT,
+        width,
+        height,
     )?;
-    target.planes[0].copy_from_raw_u8(&y, STREAM_WIDTH, 1);
-    target.planes[1].copy_from_raw_u8(&u, STREAM_WIDTH / 2, 1);
-    target.planes[2].copy_from_raw_u8(&v, STREAM_WIDTH / 2, 1);
+    target.planes[0].copy_from_raw_u8(&y, width, 1);
+    target.planes[1].copy_from_raw_u8(&u, width / 2, 1);
+    target.planes[2].copy_from_raw_u8(&v, width / 2, 1);
     Ok(())
 }
 

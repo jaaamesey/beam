@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
+    sync::mpsc::Receiver,
 };
 use tao::{
     event::Event,
@@ -20,7 +21,11 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-pub fn run(settings_url: String, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn run(
+    settings_url: String,
+    shutdown: Arc<AtomicBool>,
+    input_rx: Receiver<Vec<u8>>,
+) -> Result<()> {
     let mut event_loop = EventLoop::new();
     #[cfg(target_os = "macos")]
     {
@@ -45,8 +50,12 @@ pub fn run(settings_url: String, shutdown: Arc<AtomicBool>) -> Result<()> {
 
     let icon = icon()?;
     let mut tray = None;
+    let mut enigo = crate::input::new()?;
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100));
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2));
+        for message in input_rx.try_iter() {
+            crate::input::handle(&mut enigo, &message);
+        }
         if shutdown.load(Ordering::Relaxed) {
             *control_flow = ControlFlow::Exit;
             return;

@@ -40,9 +40,54 @@ function Shell({ children }: { children: React.ReactNode }) {
 
 function Viewer() {
   const video = useRef<HTMLVideoElement>(null)
+  const player = useRef<HTMLElement>(null)
   const peer = useRef<RTCPeerConnection | null>(null)
+  const keyboardCleanup = useRef<(() => void) | null>(null)
   const [password, setPassword] = useState('')
   const [status, setStatus] = useState('Ready')
+  const [fullscreen, setFullscreen] = useState(false)
+  const [streamAspect, setStreamAspect] = useState(16 / 9)
+
+  async function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen()
+      unlockKeyboard()
+    } else {
+      const element = player.current
+      if (!element) return
+      try {
+        await (element.requestFullscreen as (options?: { keyboardLock?: 'browser' }) => Promise<void>)({
+          keyboardLock: 'browser',
+        })
+      } catch {
+        await element.requestFullscreen()
+      }
+      const keyboard = (navigator as Navigator & {
+        keyboard?: { lock?: (keys?: string[]) => Promise<void> }
+      }).keyboard
+      try {
+        await keyboard?.lock?.(['Escape'])
+      } catch {
+        // Keyboard Lock is not available in every browser.
+      }
+    }
+  }
+
+  useEffect(() => {
+    const update = () => {
+      setFullscreen(document.fullscreenElement === player.current)
+      if (!document.fullscreenElement) unlockKeyboard()
+    }
+    document.addEventListener('fullscreenchange', update)
+    return () => document.removeEventListener('fullscreenchange', update)
+  }, [])
+
+  function unlockKeyboard() {
+    const keyboard = (navigator as Navigator & {
+      keyboard?: { unlock?: () => void }
+    }).keyboard
+    keyboard?.unlock?.()
+  }
 
   async function connect(event: React.FormEvent) {
     event.preventDefault()
@@ -50,10 +95,34 @@ function Viewer() {
     try {
       await json('/api/session', { method: 'POST', body: JSON.stringify({ password }) })
       const pc = new RTCPeerConnection({ iceServers: [] })
+      keyboardCleanup.current?.()
       peer.current?.close()
       peer.current = pc
       pc.addTransceiver('video', { direction: 'recvonly' })
+      pc.addTransceiver('audio', { direction: 'recvonly' })
       const input = pc.createDataChannel('input')
+      const streamHasFocus = () => document.fullscreenElement === player.current || document.activeElement === video.current
+      const sendMouseButton = (event: PointerEvent, down: boolean) => {
+        if (event.pointerType !== 'mouse' || input.readyState !== 'open') return
+        video.current?.focus()
+        if (!streamHasFocus()) return
+        event.preventDefault()
+        if ([0, 1, 2].includes(event.button))
+          input.send(JSON.stringify({ type: 'mouseButton', button: event.button, down }))
+      }
+      const sendKey = (type: 'keyDown' | 'keyUp', event: KeyboardEvent) => {
+        if (!streamHasFocus() || event.isComposing || input.readyState !== 'open') return
+        event.preventDefault()
+        input.send(JSON.stringify({ type, code: event.code, key: event.key }))
+      }
+      const keyDown = (event: KeyboardEvent) => sendKey('keyDown', event)
+      const keyUp = (event: KeyboardEvent) => sendKey('keyUp', event)
+      window.addEventListener('keydown', keyDown, true)
+      window.addEventListener('keyup', keyUp, true)
+      keyboardCleanup.current = () => {
+        window.removeEventListener('keydown', keyDown, true)
+        window.removeEventListener('keyup', keyUp, true)
+      }
       pc.ontrack = ({ receiver, streams: [stream] }) => {
         const lowLatency = receiver as RTCRtpReceiver & {
           jitterBufferTarget?: number
@@ -67,6 +136,10 @@ function Viewer() {
         }
         if (video.current) {
           video.current.srcObject = stream
+          video.current.onloadedmetadata = () => {
+            if (video.current?.videoWidth && video.current.videoHeight)
+              setStreamAspect(video.current.videoWidth / video.current.videoHeight)
+          }
           video.current.onpointermove = event => {
             if (event.pointerType && event.pointerType !== 'mouse') return
             const position = streamPosition(video.current!, event.clientX, event.clientY)
@@ -80,12 +153,15 @@ function Viewer() {
                 type: 'wheel', deltaX: event.deltaX, deltaY: event.deltaY, deltaMode: event.deltaMode,
               }))
           }
+          video.current.onpointerdown = event => sendMouseButton(event, true)
+          video.current.onpointerup = event => sendMouseButton(event, false)
         }
       }
       pc.onconnectionstatechange = () => {
         setStatus(pc.connectionState)
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && video.current)
           video.current.srcObject = null
+        if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) keyboardCleanup.current?.()
       }
       await pc.setLocalDescription(await pc.createOffer())
       await waitForIce(pc)
@@ -98,12 +174,24 @@ function Viewer() {
     }
   }
 
-  useEffect(() => () => peer.current?.close(), [])
+  useEffect(() => () => {
+    keyboardCleanup.current?.()
+    peer.current?.close()
+  }, [])
 
   return (
     <Shell>
-      <section className="overflow-hidden rounded-3xl border border-white/10 bg-black shadow-2xl shadow-cyan-950/20">
-        <video ref={video} autoPlay playsInline className="aspect-video w-full bg-black object-contain" />
+      <section ref={player} className="relative overflow-hidden rounded-3xl border border-white/10 bg-black shadow-2xl shadow-cyan-950/20">
+        <video ref={video} tabIndex={0} controls={false} autoPlay playsInline onClick={() => {
+          video.current?.focus()
+          void video.current?.play()
+        }}
+          style={{ aspectRatio: streamAspect }} className="w-full bg-black object-contain" />
+        <button type="button" onClick={() => void toggleFullscreen()}
+          aria-label={fullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+          className="absolute right-3 top-3 rounded-lg bg-black/60 px-3 py-2 text-sm font-medium text-white backdrop-blur hover:bg-black/80">
+          {fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+        </button>
       </section>
       <form onSubmit={connect} className="mt-6 flex flex-col gap-3 sm:flex-row">
         <input aria-label="Host password" type="password" value={password} onChange={e => setPassword(e.target.value)}
@@ -245,7 +333,7 @@ function waitForIce(pc: RTCPeerConnection) {
 
 function streamPosition(video: HTMLVideoElement, clientX: number, clientY: number) {
   const rect = video.getBoundingClientRect()
-  const streamAspect = 16 / 9
+  const streamAspect = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9
   const contentAspect = rect.width / rect.height
   const contentWidth = contentAspect > streamAspect ? rect.height * streamAspect : rect.width
   const contentHeight = contentAspect > streamAspect ? rect.height : rect.width / streamAspect
