@@ -4,7 +4,6 @@ use cidre::{arc, cf, cm, cv, os, vt};
 use std::{ffi::c_void, slice, sync::{Arc, mpsc as std_mpsc}, time::Duration};
 use tokio::sync::mpsc;
 
-const BITRATE: i32 = 8_000_000;
 const START_CODE: &[u8] = &[0, 0, 0, 1];
 
 struct Callback(std_mpsc::Sender<Result<Vec<u8>>>);
@@ -15,10 +14,11 @@ pub fn encode(
     first: Arc<RawFrame>,
     width: usize,
     height: usize,
+    bitrate: u32,
 ) -> Result<()> {
     let (encoded_tx, encoded_rx) = std_mpsc::channel();
     let mut callback = Box::new(Callback(encoded_tx));
-    let encoder = create_encoder(&mut callback, width, height)?;
+    let encoder = create_encoder(&mut callback, width, height, bitrate)?;
     let mut pixel_buffer =
         cv::PixelBuf::new(width, height, cv::PixelFormat::_32_BGRA, None)
             .context("create H.264 input buffer")?;
@@ -61,6 +61,7 @@ fn create_encoder(
     callback: &mut Callback,
     width: usize,
     height: usize,
+    bitrate: u32,
 ) -> Result<arc::R<vt::CompressionSession>> {
     let mut encoder = vt::CompressionSession::new(
         width as u32,
@@ -73,11 +74,11 @@ fn create_encoder(
         callback,
     )
     .context("create VideoToolbox H.264 encoder")?;
-    configure(&mut encoder)?;
+    configure(&mut encoder, bitrate)?;
     Ok(encoder)
 }
 
-fn configure(encoder: &mut vt::CompressionSession) -> Result<()> {
+fn configure(encoder: &mut vt::CompressionSession, bitrate: u32) -> Result<()> {
     let mut properties = cf::DictionaryMut::with_capacity(8);
     properties.insert(
         vt::compression::keys::real_time(),
@@ -93,7 +94,7 @@ fn configure(encoder: &mut vt::CompressionSession) -> Result<()> {
     );
     properties.insert(
         vt::compression::keys::avarage_bit_rate(),
-        &cf::Number::from_i32(BITRATE),
+        &cf::Number::from_i32(bitrate.min(i32::MAX as u32) as i32),
     );
     properties.insert(
         vt::compression::keys::expected_frame_rate(),
@@ -257,7 +258,7 @@ mod tests {
         let (width, height) = (super::STREAM_WIDTH, super::STREAM_HEIGHT);
         let (sender, receiver) = std_mpsc::channel();
         let mut callback = Callback(sender);
-        let encoder = create_encoder(&mut callback, width, height).unwrap();
+        let encoder = create_encoder(&mut callback, width, height, 8_000_000).unwrap();
         let pixel_buffer =
             cv::PixelBuf::new(width, height, cv::PixelFormat::_32_BGRA, None)
                 .unwrap();

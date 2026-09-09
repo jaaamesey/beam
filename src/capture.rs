@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use rav1e::prelude::*;
-use pinray::{AudioCapture, AudioFrame, CaptureEvent, CaptureSession, FrameData, SourceId, VideoCaptureTarget};
+use pinray::{AudioCapture, AudioFrame, CaptureEvent, CaptureSession, CursorMode, FrameData, SourceId, VideoCaptureTarget};
+use serde::{Deserialize, Serialize};
 use std::{
     sync::{
         Arc, Condvar, Mutex,
@@ -24,10 +25,24 @@ pub enum Codec {
 pub const CODEC: Codec = Codec::H264;
 pub const FPS: u32 = 30;
 // AV1 4:2:0 requires both stream dimensions to be even.
+#[allow(dead_code)]
 pub const STREAM_WIDTH: usize = 1920;
 #[allow(dead_code)]
 pub const STREAM_HEIGHT: usize = 1080;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+pub struct StreamSettings {
+    pub resolution: f32,
+    pub bitrate: u32,
+    pub host_cursor_visible: bool,
+}
+
+impl Default for StreamSettings {
+    fn default() -> Self {
+        Self { resolution: 1.0, bitrate: 8_000_000, host_cursor_visible: true }
+    }
+}
 
 pub struct EncodedFrame {
     pub data: Vec<u8>,
@@ -65,6 +80,7 @@ impl Drop for Session {
 pub fn spawn(
     sender: mpsc::Sender<EncodedFrame>,
     audio_sender: mpsc::Sender<AudioFrame>,
+    settings: StreamSettings,
 ) -> (Session, mpsc::Receiver<String>) {
     let latest = Arc::new((
         Mutex::new(FrameSlot {
@@ -82,7 +98,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("beam-capture".into())
         .spawn(move || {
-            if let Err(error) = capture_inner(capture_frames.clone(), capture_stop, audio_sender) {
+            if let Err(error) = capture_inner(capture_frames.clone(), capture_stop, audio_sender, settings) {
                 tracing::error!(error = ?error, "capture stopped");
                 let _ = capture_errors.blocking_send(error.to_string());
             }
@@ -93,7 +109,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("beam-av1".into())
         .spawn(move || {
-            if let Err(error) = encode(frames, sender) {
+            if let Err(error) = encode(frames, sender, settings) {
                 tracing::error!(error = ?error, "video encoder stopped");
                 let _ = errors.blocking_send(error.to_string());
             }
@@ -112,10 +128,12 @@ fn capture_inner(
     latest: LatestFrame,
     stop: Arc<AtomicBool>,
     audio_sender: mpsc::Sender<AudioFrame>,
+    settings: StreamSettings,
 ) -> Result<()> {
     let mut capturer = CaptureSession::builder()
         .video_target(VideoCaptureTarget::Display(SourceId::new("auto")))
         .audio(AudioCapture::SystemMix)
+        .cursor_mode(if settings.host_cursor_visible { CursorMode::Embedded } else { CursorMode::Hidden })
         .frame_rate(Some(FPS))
         .build()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -157,23 +175,24 @@ fn capture_inner(
     Ok(())
 }
 
-fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>) -> Result<()> {
+fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>, settings: StreamSettings) -> Result<()> {
     let Some(first) = next_frame(&frames) else { return Ok(()) };
-    let (width, height) = stream_dimensions(first.width, first.height);
+    let (width, height) = stream_dimensions(first.width, first.height, settings.resolution);
     match CODEC {
-        Codec::Av1 => encode_av1(frames, sender, first, width, height),
+        Codec::Av1 => encode_av1(frames, sender, first, width, height, settings.bitrate),
         Codec::H264 => {
             #[cfg(target_os = "macos")]
-            return h264::encode(frames, sender, first, width, height);
+            return h264::encode(frames, sender, first, width, height, settings.bitrate);
             #[cfg(not(target_os = "macos"))]
             bail!("H.264 hardware encoding is currently supported only on macOS")
         }
     }
 }
 
-pub fn stream_dimensions(source_width: usize, source_height: usize) -> (usize, usize) {
-    let height = ((STREAM_WIDTH * source_height / source_width).max(2)) & !1;
-    (STREAM_WIDTH, height)
+pub fn stream_dimensions(source_width: usize, source_height: usize, scale: f32) -> (usize, usize) {
+    let width = ((source_width as f32 * scale).round() as usize).max(2) & !1;
+    let height = ((source_height as f32 * scale).round() as usize).max(2) & !1;
+    (width, height)
 }
 
 fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
@@ -190,8 +209,9 @@ fn encode_av1(
     first: Arc<RawFrame>,
     width: usize,
     height: usize,
+    bitrate: u32,
 ) -> Result<()> {
-    let mut encoder = new_encoder(width, height)?;
+    let mut encoder = new_encoder(width, height, bitrate)?;
     let mut previous_time = None;
     let mut source = Some(first);
     loop {
@@ -219,12 +239,12 @@ fn encode_av1(
     }
 }
 
-fn new_encoder(width: usize, height: usize) -> Result<Context<u8>> {
+fn new_encoder(width: usize, height: usize, bitrate: u32) -> Result<Context<u8>> {
     let mut encoder = EncoderConfig::with_speed_preset(10);
     encoder.width = width;
     encoder.height = height;
     encoder.time_base = Rational::new(1, 1_000);
-    encoder.bitrate = 4_000_000;
+    encoder.bitrate = bitrate.min(i32::MAX as u32) as i32;
     encoder.low_latency = true;
     encoder.speed_settings.rdo_lookahead_frames = 1;
     encoder.speed_settings.scene_detection_mode = SceneDetectionSpeed::None;

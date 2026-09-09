@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -26,6 +27,26 @@ pub struct Media {
     api: webrtc::api::API,
     capability: RTCRtpCodecCapability,
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ControlMessage {
+    #[serde(rename = "setStreamSettings")]
+    SetStreamSettings {
+        resolution: f32,
+        bitrate: u32,
+        host_cursor_visible: bool,
+    },
+}
+
+#[derive(Serialize)]
+struct StreamSettingsMessage {
+    r#type: &'static str,
+    resolution: f32,
+    bitrate: u32,
+    host_cursor_visible: bool,
 }
 
 impl Media {
@@ -81,6 +102,7 @@ impl Media {
                 .build(),
             capability,
             input_tx,
+            settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
         });
         Ok(media)
     }
@@ -92,17 +114,59 @@ impl Media {
                 .await?,
         );
         let input_tx = self.input_tx.clone();
+        let settings = self.settings.clone();
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_tx = input_tx.clone();
+            let settings = settings.clone();
             Box::pin(async move {
                 if channel.label() != "input" {
                     return;
                 }
                 tracing::info!("input data channel connected");
+                let open_channel = channel.clone();
+                let open_settings = settings.clone();
+                channel.on_open(Box::new(move || {
+                    let channel = open_channel.clone();
+                    let settings = open_settings.clone();
+                    Box::pin(async move {
+                        let settings = *settings.read().await;
+                        let message = serde_json::to_string(&StreamSettingsMessage {
+                            r#type: "streamSettings",
+                            resolution: settings.resolution,
+                            bitrate: settings.bitrate,
+                            host_cursor_visible: settings.host_cursor_visible,
+                        }).unwrap();
+                        let _ = channel.send_text(message).await;
+                    })
+                }));
+                let message_channel = channel.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
                     let input_tx = input_tx.clone();
+                    let settings = settings.clone();
+                    let channel = message_channel.clone();
                     Box::pin(async move {
-                        let _ = input_tx.send(message.data.to_vec());
+                        if let Ok(ControlMessage::SetStreamSettings {
+                            resolution,
+                            bitrate,
+                            host_cursor_visible,
+                        }) = serde_json::from_slice::<ControlMessage>(&message.data)
+                        {
+                            let next = crate::capture::StreamSettings {
+                                resolution: resolution.clamp(0.25, 1.0),
+                                bitrate: bitrate.clamp(1_000_000, 100_000_000),
+                                host_cursor_visible,
+                            };
+                            *settings.write().await = next;
+                            let response = serde_json::to_string(&StreamSettingsMessage {
+                                r#type: "streamSettings",
+                                resolution: next.resolution,
+                                bitrate: next.bitrate,
+                                host_cursor_visible: next.host_cursor_visible,
+                            }).unwrap();
+                            let _ = channel.send_text(response).await;
+                        } else {
+                            let _ = input_tx.send(message.data.to_vec());
+                        }
                     })
                 }));
             })
@@ -146,7 +210,8 @@ impl Media {
             .local_description()
             .await
             .context("missing local description")?;
-        tokio::spawn(run_session(peer, track, audio_track));
+        let settings = *self.settings.read().await;
+        tokio::spawn(run_session(peer, track, audio_track, settings));
         Ok(answer)
     }
 }
@@ -155,6 +220,7 @@ async fn run_session(
     peer: Arc<RTCPeerConnection>,
     track: Arc<TrackLocalStaticSample>,
     audio_track: Arc<TrackLocalStaticSample>,
+    settings: crate::capture::StreamSettings,
 ) {
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
         while matches!(
@@ -175,7 +241,7 @@ async fn run_session(
     let (frames_tx, mut frames_rx) = mpsc::channel(1);
     let (audio_tx, mut audio_rx) = mpsc::channel(8);
     let (audio, audio_frames_tx) = crate::audio::spawn(audio_tx);
-    let (capture, mut capture_errors) = capture::spawn(frames_tx, audio_frames_tx);
+    let (capture, mut capture_errors) = capture::spawn(frames_tx, audio_frames_tx, settings);
     loop {
         tokio::select! {
             error = capture_errors.recv() => {

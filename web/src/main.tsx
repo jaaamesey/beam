@@ -42,11 +42,18 @@ function Viewer() {
   const video = useRef<HTMLVideoElement>(null)
   const player = useRef<HTMLElement>(null)
   const peer = useRef<RTCPeerConnection | null>(null)
+  const inputChannel = useRef<RTCDataChannel | null>(null)
+  const settingsReady = useRef(false)
+  const reconnecting = useRef(false)
   const keyboardCleanup = useRef<(() => void) | null>(null)
   const [password, setPassword] = useState('')
   const [status, setStatus] = useState('Ready')
   const [fullscreen, setFullscreen] = useState(false)
   const [streamAspect, setStreamAspect] = useState(16 / 9)
+  const [clientMouseVisible, setClientMouseVisible] = useState(true)
+  const [resolution, setResolution] = useState<number | null>(null)
+  const [bitrate, setBitrate] = useState<number | null>(null)
+  const [hostMouseVisible, setHostMouseVisible] = useState<boolean | null>(null)
 
   async function toggleFullscreen() {
     if (document.fullscreenElement) {
@@ -89,8 +96,8 @@ function Viewer() {
     keyboard?.unlock?.()
   }
 
-  async function connect(event: React.FormEvent) {
-    event.preventDefault()
+  async function connect(event?: React.FormEvent) {
+    event?.preventDefault()
     setStatus('Authenticating…')
     try {
       await json('/api/session', { method: 'POST', body: JSON.stringify({ password }) })
@@ -101,6 +108,31 @@ function Viewer() {
       pc.addTransceiver('video', { direction: 'recvonly' })
       pc.addTransceiver('audio', { direction: 'recvonly' })
       const input = pc.createDataChannel('input')
+      inputChannel.current = input
+      input.onmessage = event => {
+        try {
+          const message = JSON.parse(event.data) as {
+            type?: string; resolution?: number; bitrate?: number; host_cursor_visible?: boolean
+          }
+          if (message.type !== 'streamSettings' || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
+          const changed = settingsReady.current
+          setResolution(message.resolution)
+          setBitrate(message.bitrate)
+          setHostMouseVisible(message.host_cursor_visible)
+          settingsReady.current = true
+          if (changed && !reconnecting.current) {
+            reconnecting.current = true
+            pc.close()
+            window.setTimeout(() => {
+              reconnecting.current = false
+              settingsReady.current = false
+              void connect()
+            }, 100)
+          }
+        } catch {
+          // Ignore non-control messages.
+        }
+      }
       const streamHasFocus = () => document.fullscreenElement === player.current || document.activeElement === video.current
       const sendMouseButton = (event: PointerEvent, down: boolean) => {
         if (event.pointerType !== 'mouse' || input.readyState !== 'open') return
@@ -179,20 +211,57 @@ function Viewer() {
     peer.current?.close()
   }, [])
 
+  function sendStreamSettings(next: Partial<{ resolution: number; bitrate: number; host_cursor_visible: boolean }>) {
+    if (!inputChannel.current || inputChannel.current.readyState !== 'open' || resolution == null || bitrate == null || hostMouseVisible == null) return
+    inputChannel.current.send(JSON.stringify({
+      type: 'setStreamSettings',
+      resolution: next.resolution ?? resolution,
+      bitrate: next.bitrate ?? bitrate,
+      host_cursor_visible: next.host_cursor_visible ?? hostMouseVisible,
+    }))
+  }
+
   return (
     <Shell>
-      <section ref={player} className="relative overflow-hidden rounded-3xl border border-white/10 bg-black shadow-2xl shadow-cyan-950/20">
+      <section ref={player} style={{ cursor: clientMouseVisible ? 'default' : 'none' }} className="relative overflow-hidden border border-white/10 bg-black shadow-2xl shadow-cyan-950/20">
         <video ref={video} tabIndex={0} controls={false} autoPlay playsInline onClick={() => {
           video.current?.focus()
           void video.current?.play()
         }}
           style={{ aspectRatio: streamAspect }} className="w-full bg-black object-contain" />
-        <button type="button" onClick={() => void toggleFullscreen()}
+        {!fullscreen && <button type="button" onClick={() => void toggleFullscreen()}
           aria-label={fullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
           className="absolute right-3 top-3 rounded-lg bg-black/60 px-3 py-2 text-sm font-medium text-white backdrop-blur hover:bg-black/80">
           {fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-        </button>
+        </button>}
       </section>
+      {!fullscreen && resolution != null && bitrate != null && hostMouseVisible != null && <section className="mt-4 flex flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-white/[.04] p-4 text-sm">
+        <button type="button" role="switch" aria-checked={clientMouseVisible} onClick={() => setClientMouseVisible(value => !value)}
+          className="rounded-lg border border-white/10 px-3 py-2 hover:bg-white/10">
+          Client cursor: {clientMouseVisible ? 'visible' : 'hidden'}
+        </button>
+        <button type="button" role="switch" aria-checked={hostMouseVisible}
+          onClick={() => sendStreamSettings({ host_cursor_visible: !hostMouseVisible })}
+          className="rounded-lg border border-white/10 px-3 py-2 hover:bg-white/10 disabled:opacity-50">
+          Host cursor: {hostMouseVisible ? 'visible' : 'hidden'}
+        </button>
+        <label className="flex items-center gap-2">
+          Resolution
+          <select value={resolution}
+            onChange={event => sendStreamSettings({ resolution: Number(event.target.value) })}
+            className="rounded-lg border border-white/10 bg-slate-900 px-2 py-2">
+            {[0.25, 0.5, 0.75, 1].map(value => <option key={value} value={value}>{value}x</option>)}
+          </select>
+        </label>
+        <label className="flex items-center gap-2">
+          Bitrate
+          <select value={bitrate / 1_000_000}
+            onChange={event => sendStreamSettings({ bitrate: Number(event.target.value) * 1_000_000 })}
+            className="rounded-lg border border-white/10 bg-slate-900 px-2 py-2">
+            {Array.from({ length: 100 }, (_, index) => index + 1).map(value => <option key={value} value={value}>{value} Mbps</option>)}
+          </select>
+        </label>
+      </section>}
       <form onSubmit={connect} className="mt-6 flex flex-col gap-3 sm:flex-row">
         <input aria-label="Host password" type="password" value={password} onChange={e => setPassword(e.target.value)}
           placeholder="Host password" className="min-w-0 flex-1 rounded-xl border border-white/10 bg-white/5 px-4 py-3 outline-none focus:border-cyan-300/60" />
