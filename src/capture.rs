@@ -1,5 +1,4 @@
-use anyhow::{Context as _, Result, bail};
-use rav1e::prelude::*;
+use anyhow::{Result, bail};
 use pinray::{AudioCapture, AudioFrame, CaptureEvent, CaptureSession, CursorMode, FrameData, SourceId, VideoCaptureTarget};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,17 +10,23 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-#[cfg(target_os = "macos")]
-mod h264;
+pub(crate) mod ffmpeg;
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // The alternate variant is selected by changing CODEC.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Codec {
     Av1,
     H264,
+    H265,
 }
 
-// H.264 uses VideoToolbox hardware encoding on macOS; AV1 uses rav1e.
+#[derive(Clone, Copy, Serialize)]
+pub struct HardwareCodecAvailability {
+    pub h264: bool,
+    pub h265: bool,
+    pub av1: bool,
+}
+
 pub const CODEC: Codec = Codec::H264;
 pub const FPS: u32 = 30;
 // AV1 4:2:0 requires both stream dimensions to be even.
@@ -33,6 +38,7 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct StreamSettings {
+    pub codec: Codec,
     pub resolution: f32,
     pub bitrate: u32,
     pub host_cursor_visible: bool,
@@ -40,7 +46,12 @@ pub struct StreamSettings {
 
 impl Default for StreamSettings {
     fn default() -> Self {
-        Self { resolution: 1.0, bitrate: 40_000_000, host_cursor_visible: true }
+        Self {
+            codec: CODEC,
+            resolution: 1.0,
+            bitrate: 40_000_000,
+            host_cursor_visible: true,
+        }
     }
 }
 
@@ -49,12 +60,12 @@ pub struct EncodedFrame {
     pub duration: Duration,
 }
 
-struct RawFrame {
-    bgra: Vec<u8>,
-    width: usize,
-    height: usize,
-    stride: usize,
-    captured_at: SystemTime,
+pub(crate) struct RawFrame {
+    pub(crate) bgra: Vec<u8>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) stride: usize,
+    pub(crate) captured_at: SystemTime,
 }
 
 struct FrameSlot {
@@ -107,7 +118,7 @@ pub fn spawn(
         })
         .expect("capture thread");
     std::thread::Builder::new()
-        .name("beam-av1".into())
+        .name("beam-ffmpeg".into())
         .spawn(move || {
             if let Err(error) = encode(frames, sender, settings) {
                 tracing::error!(error = ?error, "video encoder stopped");
@@ -178,15 +189,7 @@ fn capture_inner(
 fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>, settings: StreamSettings) -> Result<()> {
     let Some(first) = next_frame(&frames) else { return Ok(()) };
     let (width, height) = stream_dimensions(first.width, first.height, settings.resolution);
-    match CODEC {
-        Codec::Av1 => encode_av1(frames, sender, first, width, height, settings.bitrate),
-        Codec::H264 => {
-            #[cfg(target_os = "macos")]
-            return h264::encode(frames, sender, first, width, height, settings.bitrate);
-            #[cfg(not(target_os = "macos"))]
-            bail!("H.264 hardware encoding is currently supported only on macOS")
-        }
-    }
+    ffmpeg::encode(settings.codec, frames, sender, first, width, height, settings.bitrate)
 }
 
 pub fn stream_dimensions(source_width: usize, source_height: usize, scale: f32) -> (usize, usize) {
@@ -203,75 +206,7 @@ fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
     slot.frame.take()
 }
 
-fn encode_av1(
-    frames: LatestFrame,
-    sender: mpsc::Sender<EncodedFrame>,
-    first: Arc<RawFrame>,
-    width: usize,
-    height: usize,
-    bitrate: u32,
-) -> Result<()> {
-    let mut encoder = new_encoder(width, height, bitrate)?;
-    let mut previous_time = None;
-    let mut source = Some(first);
-    loop {
-        let Some(source) = source.take().or_else(|| next_frame(&frames)) else { return Ok(()) };
-        let mut frame = encoder.new_frame();
-        copy_bgra(&source, &mut frame, width, height)?;
-        encoder.send_frame(frame).context("queue AV1 frame")?;
-        let duration = previous_time
-            .and_then(|time| source.captured_at.duration_since(time).ok())
-            .unwrap_or(Duration::from_secs_f64(1.0 / FPS as f64))
-            .clamp(Duration::from_millis(1), Duration::from_secs(1));
-        previous_time = Some(source.captured_at);
-
-        while let Ok(packet) = encoder.receive_packet() {
-            if sender
-                .blocking_send(EncodedFrame {
-                    data: packet.data,
-                    duration,
-                })
-                .is_err()
-            {
-                return Ok(());
-            }
-        }
-    }
-}
-
-fn new_encoder(width: usize, height: usize, bitrate: u32) -> Result<Context<u8>> {
-    let mut encoder = EncoderConfig::with_speed_preset(10);
-    encoder.width = width;
-    encoder.height = height;
-    encoder.time_base = Rational::new(1, 1_000);
-    encoder.bitrate = bitrate.min(i32::MAX as u32) as i32;
-    encoder.low_latency = true;
-    encoder.speed_settings.rdo_lookahead_frames = 1;
-    encoder.speed_settings.scene_detection_mode = SceneDetectionSpeed::None;
-    encoder.max_key_frame_interval = FPS as u64 * 2;
-    Config::new()
-        .with_encoder_config(encoder)
-        .with_threads(0)
-        .new_context()
-        .context("create AV1 encoder")
-}
-
-fn copy_bgra(source: &RawFrame, target: &mut rav1e::prelude::Frame<u8>, width: usize, height: usize) -> Result<()> {
-    let (y, u, v) = scale_bgra_to_i420(
-        &source.bgra,
-        source.width,
-        source.height,
-        source.stride,
-        width,
-        height,
-    )?;
-    target.planes[0].copy_from_raw_u8(&y, width, 1);
-    target.planes[1].copy_from_raw_u8(&u, width / 2, 1);
-    target.planes[2].copy_from_raw_u8(&v, width / 2, 1);
-    Ok(())
-}
-
-fn scale_bgra_to_i420(
+pub(crate) fn scale_bgra_to_i420(
     source: &[u8],
     source_width: usize,
     source_height: usize,
@@ -279,12 +214,24 @@ fn scale_bgra_to_i420(
     width: usize,
     height: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let Some(row_bytes) = source_width.checked_mul(4) else {
+        bail!("capture returned an invalid BGRA frame");
+    };
+    let Some(required_len) = source_height
+        .checked_sub(1)
+        .and_then(|last_row| last_row.checked_mul(stride))
+        .and_then(|last_row| last_row.checked_add(row_bytes))
+    else {
+        bail!("capture returned an invalid BGRA frame");
+    };
     if source_width == 0
         || source_height == 0
+        || width == 0
+        || height == 0
         || !width.is_multiple_of(2)
         || !height.is_multiple_of(2)
-        || stride < source_width
-        || source.len() < ((source_height - 1) * stride + source_width) * 4
+        || stride < row_bytes
+        || source.len() < required_len
     {
         bail!("capture returned an invalid BGRA frame");
     }
@@ -321,7 +268,9 @@ fn scale_bgra_to_i420(
                 for dx in 0..2 {
                     let (r, g, b) = match (x[column + dx], y_map[row + dy]) {
                         (Some(source_x), Some(source_y)) => {
-                            let pixel = (source_y * stride + source_x) * 4;
+                            let source_x = source_x.min(source_width - 1);
+                            let source_y = source_y.min(source_height - 1);
+                            let pixel = source_y * stride + source_x * 4;
                             (
                                 source[pixel + 2] as i32,
                                 source[pixel + 1] as i32,
@@ -362,14 +311,14 @@ mod tests {
             &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
             2,
             2,
-            2,
+            8,
             2,
             2,
         )
         .unwrap();
         assert_eq!(black, (vec![16; 4], vec![128], vec![128]));
 
-        let white = scale_bgra_to_i420(&[255; 16], 2, 2, 2, 2, 2).unwrap();
+        let white = scale_bgra_to_i420(&[255; 16], 2, 2, 8, 2, 2).unwrap();
         assert_eq!(white, (vec![235; 4], vec![128], vec![128]));
     }
 
@@ -379,7 +328,12 @@ mod tests {
         for _ in 0..2 {
             source.extend_from_slice(&[255; 12]);
         }
-        let converted = scale_bgra_to_i420(&source, 3, 2, 3, 2, 2).unwrap();
+        let converted = scale_bgra_to_i420(&source, 3, 2, 12, 2, 2).unwrap();
         assert_eq!(converted, (vec![235; 4], vec![128], vec![128]));
+    }
+
+    #[test]
+    fn rejects_truncated_bgra_rows() {
+        assert!(scale_bgra_to_i420(&[0; 16], 2, 2, 12, 2, 2).is_err());
     }
 }

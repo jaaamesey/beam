@@ -4,7 +4,9 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import './index.css'
 
 type Settings = { password: string; address: string }
-type StreamSettings = { resolution: number; bitrate: number; host_cursor_visible: boolean }
+type Codec = 'h264' | 'h265' | 'av1'
+type HardwareCodecs = { h264: boolean; h265: boolean; av1: boolean }
+type StreamSettings = { codec: Codec; resolution: number; bitrate: number; host_cursor_visible: boolean }
 const ADMIN_TOKEN = 'beam_admin_token'
 const STREAM_SETTINGS = 'beam_stream_settings'
 
@@ -13,6 +15,7 @@ function loadStreamSettings(): Partial<StreamSettings> {
     const value = JSON.parse(localStorage.getItem(STREAM_SETTINGS) || '{}') as Partial<StreamSettings>
     return {
       ...(value.resolution && [0.25, 0.5, 0.75, 1].includes(value.resolution) ? { resolution: value.resolution } : {}),
+      ...(value.codec === 'h264' || value.codec === 'h265' || value.codec === 'av1' ? { codec: value.codec } : {}),
       ...(value.bitrate && value.bitrate >= 1_000_000 && value.bitrate <= 200_000_000 ? { bitrate: value.bitrate } : {}),
       ...(typeof value.host_cursor_visible === 'boolean' ? { host_cursor_visible: value.host_cursor_visible } : {}),
     }
@@ -57,6 +60,7 @@ function Viewer() {
   const video = useRef<HTMLVideoElement>(null)
   const player = useRef<HTMLElement>(null)
   const peer = useRef<RTCPeerConnection | null>(null)
+  const connectionGeneration = useRef(0)
   const inputChannel = useRef<RTCDataChannel | null>(null)
   const settingsReady = useRef(false)
   const reconnecting = useRef(false)
@@ -69,8 +73,10 @@ function Viewer() {
   const [streamAspect, setStreamAspect] = useState(16 / 9)
   const [clientMouseVisible, setClientMouseVisible] = useState(true)
   const [resolution, setResolution] = useState<number | null>(null)
+  const [codec, setCodec] = useState<Codec | null>(null)
   const [bitrate, setBitrate] = useState<number | null>(null)
   const [hostMouseVisible, setHostMouseVisible] = useState<boolean | null>(null)
+  const [hardwareCodecs, setHardwareCodecs] = useState<HardwareCodecs | null>(null)
 
   async function toggleFullscreen() {
     if (document.fullscreenElement) {
@@ -115,6 +121,7 @@ function Viewer() {
 
   async function connect(event?: React.FormEvent) {
     event?.preventDefault()
+    const generation = ++connectionGeneration.current
     setStatus('Authenticating…')
     try {
       await json('/api/session', { method: 'POST', body: JSON.stringify({ password }) })
@@ -127,17 +134,20 @@ function Viewer() {
       const input = pc.createDataChannel('input')
       inputChannel.current = input
       input.onmessage = event => {
+        if (generation !== connectionGeneration.current) return
         try {
           const message = JSON.parse(event.data) as {
-            type?: string; resolution?: number; bitrate?: number; host_cursor_visible?: boolean
+            type?: string; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs
           }
-          if (message.type !== 'streamSettings' || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
+          if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
           const changed = settingsReady.current && hostSettings.current != null && (
+            hostSettings.current.codec !== message.codec ||
             hostSettings.current.resolution !== message.resolution ||
             hostSettings.current.bitrate !== message.bitrate ||
             hostSettings.current.host_cursor_visible !== message.host_cursor_visible
           )
           const nextSettings = {
+            codec: message.codec,
             resolution: message.resolution,
             bitrate: message.bitrate,
             host_cursor_visible: message.host_cursor_visible,
@@ -146,13 +156,16 @@ function Viewer() {
           rememberedSettings.current = nextSettings
           localStorage.setItem(STREAM_SETTINGS, JSON.stringify(nextSettings))
           setResolution(message.resolution)
+          setCodec(message.codec)
           setBitrate(message.bitrate)
           setHostMouseVisible(message.host_cursor_visible)
+          setHardwareCodecs(message.hardware_codecs ?? { h264: false, h265: false, av1: false })
           settingsReady.current = true
           if (changed && !reconnecting.current) {
             reconnecting.current = true
             pc.close()
             window.setTimeout(() => {
+              if (generation !== connectionGeneration.current) return
               reconnecting.current = false
               settingsReady.current = false
               void connect()
@@ -163,13 +176,12 @@ function Viewer() {
         }
       }
       input.onopen = () => {
+        if (generation !== connectionGeneration.current) return
         const settings = rememberedSettings.current
         if (settings.resolution == null && settings.bitrate == null && settings.host_cursor_visible == null) return
         input.send(JSON.stringify({
           type: 'setStreamSettings',
-          resolution: settings.resolution ?? 1,
-          bitrate: settings.bitrate ?? 40_000_000,
-          host_cursor_visible: settings.host_cursor_visible ?? true,
+          ...settings,
         }))
       }
       const sendMouseButton = (event: PointerEvent, down: boolean) => {
@@ -231,10 +243,22 @@ function Viewer() {
         }
       }
       pc.onconnectionstatechange = () => {
+        if (generation !== connectionGeneration.current) return
         setStatus(pc.connectionState)
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && video.current)
           video.current.srcObject = null
-        if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) keyboardCleanup.current?.()
+        if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+          keyboardCleanup.current?.()
+          settingsReady.current = false
+          if (!reconnecting.current) {
+            reconnecting.current = true
+            window.setTimeout(() => {
+              if (generation !== connectionGeneration.current) return
+              reconnecting.current = false
+              void connect()
+            }, 250)
+          }
+        }
       }
       await pc.setLocalDescription(await pc.createOffer())
       await waitForIce(pc)
@@ -248,17 +272,29 @@ function Viewer() {
   }
 
   useEffect(() => () => {
+    connectionGeneration.current++
     keyboardCleanup.current?.()
     peer.current?.close()
   }, [])
 
-  function sendStreamSettings(next: Partial<{ resolution: number; bitrate: number; host_cursor_visible: boolean }>) {
-    if (!inputChannel.current || inputChannel.current.readyState !== 'open' || resolution == null || bitrate == null || hostMouseVisible == null) return
-    inputChannel.current.send(JSON.stringify({
-      type: 'setStreamSettings',
+  function sendStreamSettings(next: Partial<StreamSettings>) {
+    if (codec == null || resolution == null || bitrate == null || hostMouseVisible == null) return
+    const settings = {
+      codec: next.codec ?? codec,
       resolution: next.resolution ?? resolution,
       bitrate: next.bitrate ?? bitrate,
       host_cursor_visible: next.host_cursor_visible ?? hostMouseVisible,
+    }
+    rememberedSettings.current = settings
+    setCodec(settings.codec)
+    setResolution(settings.resolution)
+    setBitrate(settings.bitrate)
+    setHostMouseVisible(settings.host_cursor_visible)
+    localStorage.setItem(STREAM_SETTINGS, JSON.stringify(settings))
+    if (!inputChannel.current || inputChannel.current.readyState !== 'open') return
+    inputChannel.current.send(JSON.stringify({
+      type: 'setStreamSettings',
+      ...settings,
     }))
   }
 
@@ -277,7 +313,7 @@ function Viewer() {
           {fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
         </button>}
       </section>
-      {!fullscreen && resolution != null && bitrate != null && hostMouseVisible != null && <section className="mt-4 flex flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-white/[.04] p-4 text-sm">
+      {!fullscreen && codec != null && resolution != null && bitrate != null && hostMouseVisible != null && <section className="mt-4 flex flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-white/[.04] p-4 text-sm">
         <button type="button" role="switch" aria-checked={clientMouseVisible} onClick={() => setClientMouseVisible(value => !value)}
           className="rounded-lg border border-white/10 px-3 py-2 hover:bg-white/10">
           Client cursor: {clientMouseVisible ? 'visible' : 'hidden'}
@@ -287,6 +323,15 @@ function Viewer() {
           className="rounded-lg border border-white/10 px-3 py-2 hover:bg-white/10 disabled:opacity-50">
           Host cursor: {hostMouseVisible ? 'visible' : 'hidden'}
         </button>
+        <label className="flex items-center gap-2">
+          Codec
+          <select value={codec} onChange={event => sendStreamSettings({ codec: event.target.value as Codec })}
+            className="rounded-lg border border-white/10 bg-slate-900 px-2 py-2">
+            <option value="h264">H.264{hardwareCodecs && !hardwareCodecs.h264 ? ' (slow)' : ''}</option>
+            <option value="h265">H.265{hardwareCodecs && !hardwareCodecs.h265 ? ' (slow)' : ''}</option>
+            <option value="av1">AV1{hardwareCodecs && !hardwareCodecs.av1 ? ' (slow)' : ''}</option>
+          </select>
+        </label>
         <label className="flex items-center gap-2">
           Resolution
           <select value={resolution}

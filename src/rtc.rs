@@ -7,7 +7,7 @@ use webrtc::{
     api::{
         APIBuilder,
         interceptor_registry::register_default_interceptors,
-        media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine},
+        media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS, MediaEngine},
     },
     interceptor::registry::Registry,
     data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage},
@@ -21,13 +21,13 @@ use webrtc::{
     track::track_local::{TrackLocal, track_local_static_sample::TrackLocalStaticSample},
 };
 
-use crate::capture::{self, CODEC, Codec};
+use crate::capture::{self, Codec};
 
 pub struct Media {
     api: webrtc::api::API,
-    capability: RTCRtpCodecCapability,
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
+    hardware_codecs: capture::HardwareCodecAvailability,
 }
 
 #[derive(Deserialize)]
@@ -35,50 +35,44 @@ pub struct Media {
 enum ControlMessage {
     #[serde(rename = "setStreamSettings")]
     SetStreamSettings {
-        resolution: f32,
-        bitrate: u32,
-        host_cursor_visible: bool,
+        codec: Option<Codec>,
+        resolution: Option<f32>,
+        bitrate: Option<u32>,
+        host_cursor_visible: Option<bool>,
     },
 }
 
 #[derive(Serialize)]
 struct StreamSettingsMessage {
     r#type: &'static str,
+    codec: Codec,
     resolution: f32,
     bitrate: u32,
     host_cursor_visible: bool,
+    hardware_codecs: capture::HardwareCodecAvailability,
 }
 
 impl Media {
     pub fn new(input_tx: std::sync::mpsc::Sender<Vec<u8>>) -> Result<Arc<Self>> {
         let mut engine = MediaEngine::default();
-        let (capability, payload_type) = match CODEC {
-            Codec::Av1 => (
-                RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_AV1.to_owned(),
-                    clock_rate: 90_000,
-                    ..Default::default()
-                },
-                45,
-            ),
-            Codec::H264 => (
-                RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_H264.to_owned(),
-                    clock_rate: 90_000,
-                    sdp_fmtp_line:
-                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                            .to_owned(),
-                    ..Default::default()
-                },
-                102,
-            ),
+        let h264 = RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90_000,
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
+            ..Default::default()
         };
+        let av1 = RTCRtpCodecCapability { mime_type: MIME_TYPE_AV1.to_owned(), clock_rate: 90_000, ..Default::default() };
+        let h265 = RTCRtpCodecCapability { mime_type: MIME_TYPE_HEVC.to_owned(), clock_rate: 90_000, ..Default::default() };
         engine.register_codec(
-            RTCRtpCodecParameters {
-                capability: capability.clone(),
-                payload_type,
-                ..Default::default()
-            },
+            RTCRtpCodecParameters { capability: h264, payload_type: 102, ..Default::default() },
+            RTPCodecType::Video,
+        )?;
+        engine.register_codec(
+            RTCRtpCodecParameters { capability: av1, payload_type: 45, ..Default::default() },
+            RTPCodecType::Video,
+        )?;
+        engine.register_codec(
+            RTCRtpCodecParameters { capability: h265, payload_type: 127, ..Default::default() },
             RTPCodecType::Video,
         )?;
         engine.register_codec(
@@ -100,14 +94,25 @@ impl Media {
                 .with_media_engine(engine)
                 .with_interceptor_registry(registry)
                 .build(),
-            capability,
             input_tx,
             settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            hardware_codecs: capture::ffmpeg::hardware_codecs(),
         });
         Ok(media)
     }
 
     pub async fn answer(&self, sdp: String) -> Result<RTCSessionDescription> {
+        let settings_snapshot = *self.settings.read().await;
+        let capability = match settings_snapshot.codec {
+            Codec::H264 => RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                clock_rate: 90_000,
+                sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
+                ..Default::default()
+            },
+            Codec::Av1 => RTCRtpCodecCapability { mime_type: MIME_TYPE_AV1.to_owned(), clock_rate: 90_000, ..Default::default() },
+            Codec::H265 => RTCRtpCodecCapability { mime_type: MIME_TYPE_HEVC.to_owned(), clock_rate: 90_000, ..Default::default() },
+        };
         let peer = Arc::new(
             self.api
                 .new_peer_connection(RTCConfiguration::default())
@@ -115,6 +120,7 @@ impl Media {
         );
         let input_tx = self.input_tx.clone();
         let settings = self.settings.clone();
+        let hardware_codecs = self.hardware_codecs;
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_tx = input_tx.clone();
             let settings = settings.clone();
@@ -132,9 +138,11 @@ impl Media {
                         let settings = *settings.read().await;
                         let message = serde_json::to_string(&StreamSettingsMessage {
                             r#type: "streamSettings",
+                            codec: settings.codec,
                             resolution: settings.resolution,
                             bitrate: settings.bitrate,
                             host_cursor_visible: settings.host_cursor_visible,
+                            hardware_codecs,
                         }).unwrap();
                         let _ = channel.send_text(message).await;
                     })
@@ -146,22 +154,27 @@ impl Media {
                     let channel = message_channel.clone();
                     Box::pin(async move {
                         if let Ok(ControlMessage::SetStreamSettings {
+                            codec,
                             resolution,
                             bitrate,
                             host_cursor_visible,
                         }) = serde_json::from_slice::<ControlMessage>(&message.data)
                         {
+                            let current = *settings.read().await;
                             let next = crate::capture::StreamSettings {
-                                resolution: resolution.clamp(0.25, 1.0),
-                                bitrate: bitrate.clamp(1_000_000, 200_000_000),
-                                host_cursor_visible,
+                                codec: codec.unwrap_or(current.codec),
+                                resolution: resolution.unwrap_or(current.resolution).clamp(0.25, 1.0),
+                                bitrate: bitrate.unwrap_or(current.bitrate).clamp(1_000_000, 200_000_000),
+                                host_cursor_visible: host_cursor_visible.unwrap_or(current.host_cursor_visible),
                             };
                             *settings.write().await = next;
                             let response = serde_json::to_string(&StreamSettingsMessage {
                                 r#type: "streamSettings",
+                                codec: next.codec,
                                 resolution: next.resolution,
                                 bitrate: next.bitrate,
                                 host_cursor_visible: next.host_cursor_visible,
+                                hardware_codecs,
                             }).unwrap();
                             let _ = channel.send_text(response).await;
                         } else {
@@ -172,7 +185,7 @@ impl Media {
             })
         }));
         let track = Arc::new(TrackLocalStaticSample::new(
-            self.capability.clone(),
+            capability,
             "desktop".into(),
             "beam".into(),
         ));
@@ -210,8 +223,7 @@ impl Media {
             .local_description()
             .await
             .context("missing local description")?;
-        let settings = *self.settings.read().await;
-        tokio::spawn(run_session(peer, track, audio_track, settings));
+        tokio::spawn(run_session(peer, track, audio_track, settings_snapshot));
         Ok(answer)
     }
 }
