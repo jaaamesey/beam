@@ -98,7 +98,7 @@ impl Encoder {
             video.set_time_base(Rational::new(1, FPS as i32));
             video.set_frame_rate(Some(Rational::new(FPS as i32, 1)));
             video.set_bit_rate(bitrate as usize);
-            video.set_gop((FPS * 2) as u32);
+            video.set_gop(FPS * 2);
             video.set_max_b_frames(0);
             video.set_flags(codec::Flags::LOW_DELAY);
             let mut options = Dictionary::new();

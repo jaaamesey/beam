@@ -105,8 +105,8 @@ fn append_stereo(output: &mut Vec<f32>, data: &AudioData, format: SampleFormat, 
             let size = sample_size(format);
             let frames = planes.iter().map(|plane| plane.len() / size).min().unwrap_or(0);
             for frame in 0..frames {
-                for channel in 0..channels.min(planes.len()) {
-                    samples.push(decode_one(&planes[channel], frame * size, format)?);
+                for plane in planes.iter().take(channels.min(planes.len())) {
+                    samples.push(decode_one(plane, frame * size, format)?);
                 }
             }
         }

@@ -29,11 +29,6 @@ pub struct HardwareCodecAvailability {
 
 pub const CODEC: Codec = Codec::H264;
 pub const FPS: u32 = 30;
-// AV1 4:2:0 requires both stream dimensions to be even.
-#[allow(dead_code)]
-pub const STREAM_WIDTH: usize = 1920;
-#[allow(dead_code)]
-pub const STREAM_HEIGHT: usize = 1080;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

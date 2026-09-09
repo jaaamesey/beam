@@ -69,5 +69,5 @@ fn settings_marker() -> Result<PathBuf> {
 }
 
 fn config_directory() -> Result<PathBuf> {
-    Ok(dirs::config_dir().context("no config directory")?)
+    dirs::config_dir().context("no config directory")
 }

@@ -120,10 +120,8 @@ fn main() -> Result<()> {
     let tls = tls::acceptor()?;
     runtime.spawn(run_server(listener, tls, secure, welcome));
     tracing::info!(address = %bound_address, "Beam is ready");
-    if open_settings {
-        if let Err(error) = open::that(&settings_url) {
-            tracing::warn!(%error, "could not open settings in the browser");
-        }
+    if open_settings && let Err(error) = open::that(&settings_url) {
+        tracing::warn!(%error, "could not open settings in the browser");
     }
     tray::run(settings_url, shutdown_flag, input_rx)
 }

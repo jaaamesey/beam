@@ -180,14 +180,14 @@ fn scroll(enigo: &mut Enigo, delta_x: f64, delta_y: f64, delta_mode: u32) {
         remainder.1 -= vertical as f64;
         (horizontal, vertical)
     });
-    if horizontal != 0 {
-        if let Err(error) = enigo.scroll(horizontal, enigo::Axis::Horizontal) {
-            tracing::warn!(%error, "could not scroll horizontally");
-        }
+    if horizontal != 0
+        && let Err(error) = enigo.scroll(horizontal, enigo::Axis::Horizontal)
+    {
+        tracing::warn!(%error, "could not scroll horizontally");
     }
-    if vertical != 0 {
-        if let Err(error) = enigo.scroll(vertical, enigo::Axis::Vertical) {
-            tracing::warn!(%error, "could not scroll vertically");
-        }
+    if vertical != 0
+        && let Err(error) = enigo.scroll(vertical, enigo::Axis::Vertical)
+    {
+        tracing::warn!(%error, "could not scroll vertically");
     }
 }
