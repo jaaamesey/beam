@@ -4,6 +4,13 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import './index.css'
 
 type Settings = { password: string }
+const ADMIN_TOKEN = 'beam_admin_token'
+
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+  }
+}
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -11,7 +18,7 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'content-type': 'application/json', ...init?.headers },
     ...init,
   })
-  if (!response.ok) throw new Error((await response.text()) || response.statusText)
+  if (!response.ok) throw new HttpError(response.status, (await response.text()) || response.statusText)
   return response.json()
 }
 
@@ -91,25 +98,76 @@ function Viewer() {
 }
 
 function SettingsPage() {
+  const [token] = useState(() => location.hash.slice(1) || localStorage.getItem(ADMIN_TOKEN) || '')
+  const [authorized, setAuthorized] = useState<boolean | null>(null)
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const [status, setStatus] = useState('Loading…')
 
   useEffect(() => {
-    json<Settings>('/api/admin/settings')
-      .then(value => { setPassword(value.password); setStatus('Saved on this Mac') })
-      .catch(error => setStatus(error instanceof Error ? error.message : 'Unavailable'))
-  }, [])
+    history.replaceState(null, '', location.pathname + location.search)
+    if (!token) {
+      setAuthorized(false)
+      return
+    }
+    json<Settings>('/api/admin/settings', { headers: { authorization: `Bearer ${token}` } })
+      .then(value => {
+        localStorage.setItem(ADMIN_TOKEN, token)
+        setPassword(value.password)
+        setStatus('Saved on this Mac')
+        setAuthorized(true)
+      })
+      .catch(error => {
+        if (error instanceof HttpError && [401, 403].includes(error.status)) {
+          localStorage.removeItem(ADMIN_TOKEN)
+          setAuthorized(false)
+        } else {
+          setStatus(error instanceof Error ? error.message : 'Unavailable')
+        }
+      })
+  }, [token])
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
     setStatus('Saving…')
     try {
-      await json('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ password }) })
+      await json('/api/admin/settings', {
+        method: 'PUT',
+        headers: { authorization: `Bearer ${token}` },
+        body: JSON.stringify({ password }),
+      })
       setStatus('Saved')
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Save failed')
     }
   }
+
+  async function shutdown() {
+    if (!confirm('Stop Beam server?')) return
+    setStopping(true)
+    try {
+      await json('/api/admin/shutdown', { method: 'POST', headers: { authorization: `Bearer ${token}` } })
+      setStatus('You can now close this tab')
+      window.close()
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not stop Beam')
+      setStopping(false)
+    }
+  }
+
+  if (authorized !== true) return (
+    <Shell>
+      <section className="max-w-xl rounded-3xl border border-white/10 bg-white/[.04] p-7 shadow-2xl">
+        <h1 className="text-3xl font-semibold tracking-tight">
+          {authorized === false ? 'Browser isn’t authorised' : 'Opening settings…'}
+        </h1>
+        <p className="mt-3 text-sm leading-6 text-slate-400">
+          {authorized === false ? 'Use “Open Beam Settings” in the Beam tray menu.' : status}
+        </p>
+      </section>
+    </Shell>
+  )
 
   return (
     <Shell>
@@ -119,13 +177,29 @@ function SettingsPage() {
         <p className="mt-3 text-sm leading-6 text-slate-400">This page can change settings only when opened on the host Mac.</p>
         <form onSubmit={save} className="mt-8">
           <label className="mb-2 block text-sm font-medium" htmlFor="password">Client password</label>
-          <input id="password" value={password} onChange={e => setPassword(e.target.value)} minLength={12} required
-            className="w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3 font-mono outline-none focus:border-cyan-300/60" />
+          <div className="relative">
+            <input id="password" type={showPassword ? 'text' : 'password'} value={password}
+              onChange={e => setPassword(e.target.value)} minLength={12} required
+              className="w-full rounded-xl border border-white/10 bg-black/30 py-3 pl-4 pr-12 font-mono outline-none focus:border-cyan-300/60" />
+            <button type="button" onClick={() => setShowPassword(value => !value)}
+              aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword}
+              className="absolute inset-y-0 right-0 grid w-12 place-items-center text-slate-400 hover:text-white">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="size-5">
+                {showPassword ? <><path d="m3 3 18 18" /><path d="M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 4.2A10.5 10.5 0 0 1 12 4c5.5 0 9 8 9 8a18 18 0 0 1-2.1 3.2M6.6 6.6C4.4 8.1 3 12 3 12s3.5 8 9 8a9.8 9.8 0 0 0 4.1-.9" /></> : <><path d="M3 12s3.5-8 9-8 9 8 9 8-3.5 8-9 8-9-8-9-8Z" /><circle cx="12" cy="12" r="3" /></>}
+              </svg>
+            </button>
+          </div>
           <div className="mt-5 flex items-center gap-4">
             <button className="rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Save password</button>
             <span className="text-sm text-slate-400">{status}</span>
           </div>
         </form>
+        <div className="mt-8 border-t border-white/10 pt-6">
+          <button type="button" onClick={shutdown} disabled={stopping}
+            className="rounded-xl border border-red-400/30 px-5 py-2.5 font-semibold text-red-300 hover:bg-red-400/10 disabled:opacity-50">
+            {stopping ? 'Stopping…' : 'Stop Beam server'}
+          </button>
+        </div>
       </section>
     </Shell>
   )

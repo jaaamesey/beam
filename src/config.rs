@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
@@ -6,6 +7,7 @@ use std::{fs, path::PathBuf};
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
     pub password: String,
+    pub admin_token: String,
 }
 
 impl Config {
@@ -20,6 +22,7 @@ impl Config {
                 .take(24)
                 .map(char::from)
                 .collect(),
+            admin_token: admin_token(),
         };
         config.save()?;
         Ok(config)
@@ -36,6 +39,12 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn admin_token() -> String {
+    let mut bytes = [0; 32];
+    rand::rng().fill(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn path() -> Result<PathBuf> {

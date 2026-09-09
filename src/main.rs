@@ -1,26 +1,46 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod capture;
 mod config;
 mod rtc;
+mod tls;
+mod tray;
 
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{ConnectInfo, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::IntoResponse,
     routing::{get, post},
 };
 use config::Config;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
 use rand::{Rng, distr::Alphanumeric};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream},
+    sync::RwLock,
+};
+use tokio_rustls::TlsAcceptor;
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -34,9 +54,10 @@ struct App {
     config: RwLock<Config>,
     sessions: RwLock<HashMap<String, Instant>>,
     media: Arc<rtc::Media>,
+    shutdown: Arc<AtomicBool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Password {
     password: String,
 }
@@ -46,41 +67,120 @@ struct Offer {
     sdp: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("beam=info".parse()?),
         )
         .init();
 
+    let runtime = tokio::runtime::Runtime::new()?;
+    let listener = runtime.block_on(TcpListener::bind(ADDRESS))?;
+    let config = Config::load()?;
+    let settings_url = format!("https://127.0.0.1:9470/settings#{}", config.admin_token);
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let app = Arc::new(App {
-        config: RwLock::new(Config::load()?),
+        config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
         media: rtc::Media::new()?,
+        shutdown: shutdown_flag.clone(),
     });
 
     let files = ServeDir::new("web/dist").not_found_service(ServeFile::new("web/dist/index.html"));
-    let router = Router::new()
+    let secure = Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", post(login))
         .route("/api/offer", post(offer))
         .route("/api/admin/settings", get(get_settings).put(put_settings))
+        .route("/api/admin/shutdown", post(shutdown))
         .fallback_service(files)
         .layer(TraceLayer::new_for_http())
         .with_state(app);
-
-    let listener = TcpListener::bind(ADDRESS).await?;
+    let welcome = Router::new().fallback(welcome);
+    let tls = tls::acceptor()?;
+    runtime.spawn(run_server(listener, tls, secure, welcome));
     tracing::info!(address = ADDRESS, "Beam is ready");
-    if let Err(error) = open::that("http://127.0.0.1:9470/settings") {
+    if let Err(error) = open::that(&settings_url) {
         tracing::warn!(%error, "could not open settings in the browser");
     }
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    tray::run(settings_url, shutdown_flag)
+}
+
+async fn run_server(listener: TcpListener, tls: TlsAcceptor, secure: Router, welcome: Router) {
+    loop {
+        let (stream, address) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::error!(%error, "could not accept connection");
+                continue;
+            }
+        };
+        let (tls, secure, welcome) = (tls.clone(), secure.clone(), welcome.clone());
+        tokio::spawn(async move {
+            if let Err(error) = handle_connection(stream, address, tls, secure, welcome).await {
+                tracing::debug!(%address, %error, "connection closed");
+            }
+        });
+    }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    address: SocketAddr,
+    tls: TlsAcceptor,
+    secure: Router,
+    welcome: Router,
+) -> Result<()> {
+    stream.set_nodelay(true)?;
+    let mut first = [0];
+    tokio::time::timeout(Duration::from_secs(5), stream.peek(&mut first)).await??;
+    if first[0] == 22 {
+        let stream = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await??;
+        serve_connection(stream, address, secure).await
+    } else {
+        serve_connection(stream, address, welcome).await
+    }
+}
+
+async fn serve_connection<I>(stream: I, address: SocketAddr, router: Router) -> Result<()>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = router.layer(Extension(ConnectInfo(address)));
+    Builder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(service))
+        .await
+        .map_err(|error| anyhow::anyhow!("serve connection: {error}"))?;
     Ok(())
+}
+
+async fn welcome(method: Method, uri: Uri, headers: HeaderMap) -> impl IntoResponse {
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<axum::http::uri::Authority>().ok())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let path = uri.path_and_query().map_or("/", |value| value.as_str());
+    let target = format!("https://{host}{path}").replace('&', "&amp;");
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action https:",
+            ),
+        ],
+        format!(
+            r#"<!doctype html><meta name="viewport" content="width=device-width"><title>Beam</title><style>body{{margin:0;background:#080b10;color:#eef2ff;font:16px system-ui;display:grid;place-items:center;min-height:100vh}}main{{max-width:32rem;padding:2rem}}a{{display:inline-block;margin-top:1rem;padding:.8rem 1rem;border-radius:.7rem;background:#67e8f9;color:#082f49;text-decoration:none;font-weight:700}}</style><main><h1>Continue securely</h1><p>Beam uses a self-signed certificate, so your browser will show a warning the first time.</p><a href="{target}">Open Beam over HTTPS</a></main>"#
+        ),
+    )
+        .into_response()
 }
 
 async fn login(
@@ -107,9 +207,9 @@ async fn login(
         .insert(token.clone(), Instant::now() + Duration::from_secs(86_400));
     let mut headers = HeaderMap::new();
     headers.insert(
-        SET_COOKIE,
+        header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400"
+            "{COOKIE}={token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400"
         ))
         .unwrap(),
     );
@@ -132,17 +232,21 @@ async fn offer(
 async fn get_settings(
     State(app): State<Arc<App>>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
-) -> HttpResult<Json<Config>> {
-    require_loopback(address)?;
-    Ok(Json(app.config.read().await.clone()))
+    headers: HeaderMap,
+) -> HttpResult<Json<Password>> {
+    require_admin(&app, address, &headers).await?;
+    Ok(Json(Password {
+        password: app.config.read().await.password.clone(),
+    }))
 }
 
 async fn put_settings(
     State(app): State<Arc<App>>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(input): Json<Password>,
 ) -> HttpResult<Json<serde_json::Value>> {
-    require_loopback(address)?;
+    require_admin(&app, address, &headers).await?;
     if input.password.len() < 12 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -151,11 +255,42 @@ async fn put_settings(
     }
     let config = Config {
         password: input.password,
+        admin_token: app.config.read().await.admin_token.clone(),
     };
     config.save().map_err(internal)?;
     *app.config.write().await = config;
     app.sessions.write().await.clear();
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn shutdown(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<serde_json::Value>> {
+    require_admin(&app, address, &headers).await?;
+    let shutdown = app.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.store(true, Ordering::Relaxed);
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn require_admin(app: &App, address: SocketAddr, headers: &HeaderMap) -> HttpResult<()> {
+    require_loopback(address)?;
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let valid: bool = token
+        .as_bytes()
+        .ct_eq(app.config.read().await.admin_token.as_bytes())
+        .into();
+    valid
+        .then_some(())
+        .ok_or((StatusCode::UNAUTHORIZED, "Browser is not authorized".into()))
 }
 
 fn require_loopback(address: SocketAddr) -> HttpResult<()> {
