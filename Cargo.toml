@@ -63,7 +63,6 @@ ffmpeg-sys-next = { version = "9", default-features = false, features = [
     "build-lib-x264",
     "build-lib-x265",
     "build-lib-svtav1",
-    "build-lib-aom",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

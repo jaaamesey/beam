@@ -20,7 +20,7 @@ jobs:
       - uses: ilammy/setup-nasm@v1
       - name: Install FFmpeg codec dependencies
         run: |
-          vcpkg install pkgconf:x64-windows ffnvcodec:x64-windows x264:x64-windows x265:x64-windows svt-av1:x64-windows aom:x64-windows
+          vcpkg install pkgconf:x64-windows ffnvcodec:x64-windows x264:x64-windows x265:x64-windows svt-av1:x64-windows
           echo "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/tools/pkgconf" >> $env:GITHUB_PATH
           echo "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/lib/pkgconfig" >> $env:GITHUB_ENV
           echo "PKG_CONFIG=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/tools/pkgconf/pkgconf.exe" >> $env:GITHUB_ENV
@@ -50,7 +50,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             clang cmake nasm pkg-config \
-            libx264-dev libx265-dev libsvtav1-dev libsvtav1enc-dev libaom-dev \
+            libx264-dev libx265-dev libsvtav1-dev libsvtav1enc-dev \
             libffmpeg-nvenc-dev libva-dev \
             libgtk-3-dev libayatana-appindicator3-dev \
             libpipewire-0.3-dev libspa-0.2-dev \
@@ -81,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install CMake
-        run: brew install cmake pkg-config x264 x265 svt-av1 aom
+        run: brew install cmake pkg-config x264 x265 svt-av1
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:

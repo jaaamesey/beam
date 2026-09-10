@@ -85,7 +85,7 @@ impl Encoder {
         let (hardware, software): (&[&str], &[&str]) = match codec {
             Codec::H264 => (hardware_names("h264"), &["libx264"]),
             Codec::H265 => (hardware_names("hevc"), &["libx265"]),
-            Codec::Av1 => (hardware_names("av1"), &["libsvtav1", "libaom-av1"]),
+            Codec::Av1 => (hardware_names("av1"), &["libsvtav1"]),
         };
         let mut last_error = None;
         for &name in hardware.iter().chain(software.iter()) {
@@ -135,13 +135,6 @@ fn set_low_latency_options(name: &str, options: &mut Dictionary) {
             // SVT presets run from 0 (slowest) through 13 (fastest).
             options.set("preset", "13");
             options.set("svtav1-params", "la_depth=0:scd=0");
-        }
-        "libaom-av1" => {
-            options.set("usage", "realtime");
-            options.set("cpu-used", "8");
-            options.set("lag-in-frames", "0");
-            options.set("row-mt", "1");
-            options.set("end-usage", "cbr");
         }
         name if name.ends_with("_nvenc") => {
             options.set("preset", "p1");

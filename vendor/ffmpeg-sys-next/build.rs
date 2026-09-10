@@ -634,7 +634,6 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     enable!(configure, "BUILD_LIB_X264", "libx264");
     enable!(configure, "BUILD_LIB_X265", "libx265");
     enable!(configure, "BUILD_LIB_SVTAV1", "libsvtav1");
-    enable!(configure, "BUILD_LIB_AOM", "libaom");
     enable!(configure, "BUILD_LIB_XAVS", "libxavs");
     enable!(configure, "BUILD_LIB_XVID", "libxvid");
 

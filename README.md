@@ -1,11 +1,3 @@
-# Beam
-
-Mac-first desktop streaming: a Rust host captures the primary display, encodes
-it, and sends it to the bundled React client over WebRTC.
-
-The current stream canvas is fixed at 1920×1080. Native captures are scaled to
-fit without changing aspect ratio, with letterboxing where necessary.
-
 ## Run
 
 Requirements: Rust, pnpm, macOS 12.3+, and Screen Recording permission for the
@@ -19,7 +11,7 @@ cargo run --release
 
 The bundled FFmpeg build requires the x264 and x265 development libraries to
 be discoverable through `pkg-config`; release builds should also provide
-SVT-AV1 or libaom to enable the AV1 software fallback.
+SVT-AV1 to enable the AV1 software fallback.
 
 Beam opens `http://127.0.0.1:9470/settings` on launch. The settings API accepts
 loopback connections only. Other devices on the LAN can open
