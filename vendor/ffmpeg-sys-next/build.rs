@@ -758,7 +758,9 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     // time on platforms like mac which spawns thousands of nullabilty complieance warnings
     configure.arg("--extra-cflags=-w");
 
-    // run ./configure
+    // Keep the command visible in CI: FFmpeg's configure errors are otherwise
+    // easy to lose behind Cargo's build-script output.
+    println!("FFmpeg configure command: {:?}", configure);
     let output = configure
         .output()
         .unwrap_or_else(|_| panic!("{:?} failed", configure));

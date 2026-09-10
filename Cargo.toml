@@ -59,7 +59,6 @@ ffmpeg-sys-next = { version = "9", default-features = false, features = [
     "build-amf",
     "build-lib-d3d11va",
     "build-lib-dxva2",
-    "build-lib-libmfx",
     "build-license-gpl",
     "build-lib-x264",
     "build-lib-x265",
