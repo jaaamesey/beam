@@ -12,7 +12,7 @@ permissions:
 jobs:
   windows-x64:
     name: Windows x64
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,10 +20,24 @@ jobs:
       - uses: ilammy/setup-nasm@v1
       - name: Install FFmpeg codec dependencies
         run: |
+          choco install make --no-progress -y
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
           vcpkg install pkgconf:x64-windows ffnvcodec:x64-windows x264:x64-windows x265:x64-windows svt-av1:x64-windows
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          echo "VCPKG_DEFAULT_TRIPLET=x64-windows" >> $env:GITHUB_ENV
           echo "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/tools/pkgconf" >> $env:GITHUB_PATH
           echo "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/lib/pkgconfig" >> $env:GITHUB_ENV
           echo "PKG_CONFIG=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/tools/pkgconf/pkgconf.exe" >> $env:GITHUB_ENV
+          $pkgconf = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/tools/pkgconf/pkgconf.exe"
+          & $pkgconf --modversion x264
+          & $pkgconf --modversion x265
+          & $pkgconf --modversion SvtAv1Enc
+          & $pkgconf --modversion ffnvcodec
+          Get-Command cl.exe
+          Get-Command link.exe
+          Get-Command sh.exe
+          Get-Command make.exe
+          Get-Command nasm.exe
       - uses: pnpm/action-setup@v4
         with:
           version: 11.19.0
@@ -35,37 +49,41 @@ jobs:
       - run: pnpm --dir web install --frozen-lockfile
       - run: pnpm --dir web build
       - run: cargo build --release --locked
+      - name: Upload FFmpeg configure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beam-windows-ffmpeg-config
+          path: target/**/ffbuild/config.log
+          if-no-files-found: ignore
+      - name: Bundle codec runtime libraries
+        run: Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" target/release/
       - uses: actions/upload-artifact@v4
         with:
           name: beam-windows-x64
-          path: target/release/beam.exe
+          path: |
+            target/release/beam.exe
+            target/release/*.dll
 
   linux-wayland-x64:
     name: Linux x64 Wayland
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: FFmpeg/nv-codec-headers
-          ref: n13.0.19.0
-          path: .ci/nv-codec-headers
       - name: Install native dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             clang cmake nasm pkg-config \
             libx264-dev libx265-dev libsvtav1-dev libsvtav1enc-dev \
-            libva-dev \
+            libffmpeg-nvenc-dev libva-dev \
             libgtk-3-dev libayatana-appindicator3-dev \
             libpipewire-0.3-dev libspa-0.2-dev \
             libwayland-dev libxkbcommon-dev \
             libx11-dev libxtst-dev libxdo-dev
-          sudo make -C .ci/nv-codec-headers install
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
           pkg-config --modversion SvtAv1Enc
           pkg-config --cflags --libs SvtAv1Enc
-          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig pkg-config --modversion ffnvcodec
+          pkg-config --modversion ffnvcodec
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:

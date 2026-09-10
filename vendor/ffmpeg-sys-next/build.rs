@@ -352,6 +352,26 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     configure.current_dir(&source_dir);
     configure.arg(format!("--prefix={}", search().to_string_lossy()));
 
+    if let Ok(pkg_config) = env::var("PKG_CONFIG") {
+        configure.arg(format!("--pkg-config={}", pkg_config.replace('\\', "/")));
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && let Ok(vcpkg_root) = env::var("VCPKG_INSTALLATION_ROOT")
+    {
+        let triplet =
+            env::var("VCPKG_DEFAULT_TRIPLET").unwrap_or_else(|_| "x64-windows".to_string());
+        let installed = Path::new(&vcpkg_root).join("installed").join(triplet);
+        let include = installed
+            .join("include")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let lib = installed.join("lib").to_string_lossy().replace('\\', "/");
+        println!("cargo:rustc-link-search=native={lib}");
+        configure.arg(format!("--extra-cflags=-I{include}"));
+        configure.arg(format!("--extra-ldflags=-libpath:{lib}"));
+    }
+
     let target = env::var("TARGET").unwrap();
     let host = env::var("HOST").unwrap();
     if target != host {
@@ -513,7 +533,7 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     }
 
     // control debug build
-    if env::var("DEBUG").is_ok() {
+    if env::var("DEBUG").as_deref() == Ok("true") {
         configure.arg("--enable-debug");
         configure.arg("--disable-stripping");
     } else {
@@ -744,7 +764,10 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
 
     // other external libraries
     enable!(configure, "BUILD_LIB_DRM", "libdrm");
-    enable!(configure, "BUILD_NVENC", "nvenc");
+    if env::var("CARGO_FEATURE_BUILD_NVENC").is_ok() {
+        configure.arg("--enable-ffnvcodec");
+        configure.arg("--enable-nvenc");
+    }
 
     // configure external protocols
     enable!(configure, "BUILD_LIB_SMBCLIENT", "libsmbclient");
@@ -1137,13 +1160,24 @@ fn main() {
                 .map(|lib| &lib[2..])
                 .for_each(|lib| println!("cargo:rustc-link-lib={lib}"));
 
+            if target_os == "windows" {
+                extra_linker_args
+                    .iter()
+                    .filter_map(|flag| flag.strip_suffix(".lib"))
+                    .filter_map(|lib| Path::new(lib).file_name())
+                    .for_each(|lib| println!("cargo:rustc-link-lib={}", lib.to_string_lossy()));
+            }
+
             extra_linker_args
                 .iter()
-                .filter(|v| v.starts_with("-L"))
-                .map(|flag| {
-                    let path = &flag[2..];
-                    if path.starts_with('/') {
-                        PathBuf::from(path)
+                .filter_map(|flag| {
+                    flag.strip_prefix("-L")
+                        .or_else(|| flag.strip_prefix("-libpath:"))
+                })
+                .map(|path| {
+                    let path = PathBuf::from(path);
+                    if path.is_absolute() {
+                        path
                     } else {
                         source().join(path)
                     }
