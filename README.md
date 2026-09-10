@@ -4,6 +4,10 @@ Requirements: Rust, pnpm, Git, and the platform compiler toolchain. On macOS,
 Beam requires macOS 12.3+ and Screen Recording permission for the terminal (or
 packaged app) running it.
 
+Linux also requires the development packages for GTK 3, Ayatana AppIndicator,
+PipeWire, Wayland, XKB, X11/XTest, xdo, and DRM. On Debian/Ubuntu, the complete
+CI package list is in `.github/workflows/canary.yml`.
+
 ```sh
 ./scripts/bootstrap-ffmpeg.sh
 pnpm --dir web install

@@ -5,6 +5,11 @@ $VcpkgRoot = Join-Path $RepoRoot ".vcpkg"
 $VcpkgRevision = "3723ec118c8354290925feb58d021a9205a3e772"
 $Triplet = "x64-windows-static-md-release"
 
+# Visual Studio developer shells define VCPKG_ROOT for VS's bundled vcpkg.
+# Beam deliberately uses its pinned project-local checkout instead.
+$env:VCPKG_ROOT = $VcpkgRoot
+$env:VCPKGRS_TRIPLET = $Triplet
+
 if (-not (Test-Path (Join-Path $VcpkgRoot ".git"))) {
     git clone https://github.com/microsoft/vcpkg.git $VcpkgRoot
     if ($LASTEXITCODE -ne 0) { throw "failed to clone vcpkg" }
@@ -29,4 +34,9 @@ if ($LASTEXITCODE -ne 0) { throw "failed to build static FFmpeg" }
 
 $Avcodec = Join-Path $VcpkgRoot "installed/$Triplet/lib/avcodec.lib"
 if (-not (Test-Path $Avcodec)) { throw "static avcodec.lib was not installed" }
+$Status = Join-Path $VcpkgRoot "installed/vcpkg/status"
+if (-not (Test-Path $Status)) { throw "vcpkg installation metadata was not created" }
+if (-not (Select-String -Path $Status -Pattern '^Package: ffmpeg$' -Quiet)) {
+    throw "vcpkg status database does not contain FFmpeg"
+}
 Write-Host "Static FFmpeg is ready for Cargo ($Triplet)."

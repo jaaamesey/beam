@@ -22,6 +22,11 @@ jobs:
           path: .vcpkg
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
+      - name: Select project-local vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:GITHUB_WORKSPACE\.vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_TRIPLET=x64-windows-static-md-release" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build static FFmpeg dependencies
         shell: pwsh
         run: ./scripts/bootstrap-ffmpeg.ps1
@@ -63,7 +68,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            clang cmake nasm pkg-config \
+            clang cmake nasm pkg-config libdrm-dev \
             libgtk-3-dev libayatana-appindicator3-dev \
             libpipewire-0.3-dev libspa-0.2-dev \
             libwayland-dev libxkbcommon-dev \
