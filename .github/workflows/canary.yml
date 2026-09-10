@@ -16,6 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/setup-nasm@v1
       - name: Install FFmpeg codec dependencies
         run: |
           vcpkg install pkgconf:x64-windows ffnvcodec:x64-windows x264:x64-windows x265:x64-windows svt-av1:x64-windows aom:x64-windows
@@ -47,7 +48,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            clang cmake pkg-config \
+            clang cmake nasm pkg-config \
             libx264-dev libx265-dev libsvtav1-dev libaom-dev \
             libffmpeg-nvenc-dev libva-dev \
             libgtk-3-dev libayatana-appindicator3-dev \
