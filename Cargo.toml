@@ -13,9 +13,6 @@ identifier = "com.beam.streaming"
 category = "public.app-category.utilities"
 resources = ["web/dist"]
 
-[patch.crates-io]
-ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
-
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["json"] }
@@ -47,26 +44,8 @@ ffmpeg-next = { version = "9", default-features = false, features = [
     "format",
     "filter",
     "software-scaling",
-    "build",
-    "build-lib-x264",
-    "build-lib-x265",
-] }
-ffmpeg-sys-next = { version = "9", default-features = false, features = [
-    "build",
-    "build-portable",
-    "build-videotoolbox",
-    "build-vaapi",
-    "build-amf",
-    "build-lib-d3d11va",
-    "build-lib-dxva2",
-    "build-license-gpl",
-    "build-lib-x264",
-    "build-lib-x265",
-    "build-lib-svtav1",
+    "static",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = "0.0.2"
-
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-ffmpeg-sys-next = { version = "9", default-features = false, features = ["build-nvenc"] }

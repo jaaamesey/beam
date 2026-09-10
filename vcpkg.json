@@ -1,0 +1,51 @@
+{
+  "name": "beam-native-dependencies",
+  "version-string": "0.1.0",
+  "builtin-baseline": "3723ec118c8354290925feb58d021a9205a3e772",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avfilter",
+        "avformat",
+        "gpl",
+        "svt-av1",
+        "swscale",
+        "x264",
+        "x265"
+      ]
+    }
+  ],
+  "features": {
+    "linux-hardware": {
+      "description": "Linux hardware video encoders",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "nvcodec",
+            "qsv",
+            "vaapi"
+          ]
+        }
+      ]
+    },
+    "windows-hardware": {
+      "description": "Windows hardware video encoders",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "amf",
+            "nvcodec",
+            "qsv"
+          ]
+        }
+      ]
+    }
+  }
+}

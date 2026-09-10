@@ -3,4 +3,5 @@
 /web/node_modules
 *.log
 .pnpm-store/
-
+/.vcpkg/
+/vcpkg_installed/
