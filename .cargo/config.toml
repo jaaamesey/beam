@@ -1,0 +1,5 @@
+[env]
+PKG_CONFIG = { value = "scripts/vcpkg-pkg-config", relative = true }
+PKG_CONFIG_ALL_STATIC = "1"
+VCPKG_ROOT = { value = ".vcpkg", relative = true }
+VCPKGRS_TRIPLET = "x64-windows-static-md-release"

@@ -13,9 +13,6 @@ jobs:
   windows-x64:
     name: Windows x64
     runs-on: windows-2022
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
-      VCPKGRS_TRIPLET: x64-windows-static-md-release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -27,18 +24,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Build static FFmpeg dependencies
         shell: pwsh
-        run: |
-          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
-          & "$env:VCPKG_ROOT/vcpkg.exe" install `
-            --triplet=x64-windows-static-md-release `
-            --overlay-triplets="$env:GITHUB_WORKSPACE/vcpkg-triplets" `
-            --x-install-root="$env:VCPKG_ROOT/installed" `
-            --clean-buildtrees-after-build `
-            --clean-packages-after-build `
-            --x-feature=windows-hardware
-          if (-not (Test-Path "$env:VCPKG_ROOT/installed/x64-windows-static-md-release/lib/avcodec.lib")) {
-            throw "static avcodec.lib was not installed"
-          }
+        run: ./scripts/bootstrap-ffmpeg.ps1
       - uses: pnpm/action-setup@v4
         with:
           version: 11.19.0
@@ -66,10 +52,6 @@ jobs:
   linux-wayland-x64:
     name: Linux x64 Wayland
     runs-on: ubuntu-latest
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
-      PKG_CONFIG_PATH: ${{ github.workspace }}/.vcpkg/installed/x64-linux-static-release/lib/pkgconfig
-      PKG_CONFIG_ALL_STATIC: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -87,17 +69,7 @@ jobs:
             libwayland-dev libxkbcommon-dev \
             libx11-dev libxtst-dev libxdo-dev
       - name: Build static FFmpeg dependencies
-        run: |
-          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
-          "$VCPKG_ROOT/vcpkg" install \
-            --triplet x64-linux-static-release \
-            --overlay-triplets="$GITHUB_WORKSPACE/vcpkg-triplets" \
-            --x-install-root="$VCPKG_ROOT/installed" \
-            --clean-buildtrees-after-build \
-            --clean-packages-after-build \
-            --x-feature=linux-hardware
-          test -f "$VCPKG_ROOT/installed/x64-linux-static-release/lib/libavcodec.a"
-          pkg-config --static --libs libavcodec
+        run: ./scripts/bootstrap-ffmpeg.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:
@@ -123,10 +95,6 @@ jobs:
   macos-arm64:
     name: macOS arm64
     runs-on: macos-14
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
-      PKG_CONFIG_PATH: ${{ github.workspace }}/.vcpkg/installed/arm64-osx-static-release/lib/pkgconfig
-      PKG_CONFIG_ALL_STATIC: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -137,16 +105,7 @@ jobs:
       - name: Install native dependencies
         run: brew install pkg-config
       - name: Build static FFmpeg dependencies
-        run: |
-          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
-          "$VCPKG_ROOT/vcpkg" install \
-            --triplet arm64-osx-static-release \
-            --overlay-triplets="$GITHUB_WORKSPACE/vcpkg-triplets" \
-            --clean-buildtrees-after-build \
-            --clean-packages-after-build \
-            --x-install-root="$VCPKG_ROOT/installed"
-          test -f "$VCPKG_ROOT/installed/arm64-osx-static-release/lib/libavcodec.a"
-          pkg-config --static --libs libavcodec
+        run: ./scripts/bootstrap-ffmpeg.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:

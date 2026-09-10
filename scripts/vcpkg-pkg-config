@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64)
+    triplet=arm64-osx-static-release
+    ;;
+  Linux:x86_64)
+    triplet=x64-linux-static-release
+    ;;
+  *)
+    echo "unsupported host for Beam's bundled FFmpeg: $(uname -s) $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+vcpkg_pkgconfig="$repo_root/.vcpkg/installed/$triplet/lib/pkgconfig"
+if [ ! -d "$vcpkg_pkgconfig" ]; then
+  echo "Beam's static FFmpeg dependencies are not installed." >&2
+  echo "Run ./scripts/bootstrap-ffmpeg.sh once, then retry Cargo." >&2
+  exit 1
+fi
+
+if [ -n "${PKG_CONFIG_PATH:-}" ]; then
+  export PKG_CONFIG_PATH="$vcpkg_pkgconfig:$PKG_CONFIG_PATH"
+else
+  export PKG_CONFIG_PATH="$vcpkg_pkgconfig"
+fi
+
+exec pkg-config "$@"

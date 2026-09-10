@@ -1,20 +1,25 @@
 ## Run
 
-Requirements: Rust, pnpm, macOS 12.3+, and Screen Recording permission for the
-terminal (or packaged app) running Beam.
+Requirements: Rust, pnpm, Git, and the platform compiler toolchain. On macOS,
+Beam requires macOS 12.3+ and Screen Recording permission for the terminal (or
+packaged app) running it.
 
 ```sh
+./scripts/bootstrap-ffmpeg.sh
 pnpm --dir web install
 pnpm --dir web build
 cargo run --release
 ```
 
+On Windows, run `./scripts/bootstrap-ffmpeg.ps1` from PowerShell instead. The
+bootstrap is a one-time operation; normal Cargo commands automatically find
+the resulting project-local FFmpeg installation.
+
 FFmpeg and its codec libraries are statically linked. Their exact versions and
 features are declared in `vcpkg.json`; the release workflow builds them with
-the release-only static triplets in `vcpkg-triplets`. On Linux and macOS,
-`PKG_CONFIG_PATH` must point at the selected vcpkg triplet's `lib/pkgconfig`
-directory before running Cargo. On Windows, set `VCPKG_ROOT` and
-`VCPKGRS_TRIPLET` to the vcpkg checkout and selected static triplet.
+the release-only static triplets in `vcpkg-triplets`. Cargo's checked-in config
+discovers the project-local vcpkg installation without shell-specific
+environment variables.
 
 Beam opens `http://127.0.0.1:9470/settings` on launch. The settings API accepts
 loopback connections only. Other devices on the LAN can open
