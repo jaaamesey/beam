@@ -45,19 +45,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: FFmpeg/nv-codec-headers
+          ref: n13.0.19.0
+          path: .ci/nv-codec-headers
       - name: Install native dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             clang cmake nasm pkg-config \
             libx264-dev libx265-dev libsvtav1-dev libsvtav1enc-dev \
-            libffmpeg-nvenc-dev libva-dev \
+            libva-dev \
             libgtk-3-dev libayatana-appindicator3-dev \
             libpipewire-0.3-dev libspa-0.2-dev \
             libwayland-dev libxkbcommon-dev \
             libx11-dev libxtst-dev libxdo-dev
+          sudo make -C .ci/nv-codec-headers install
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
           pkg-config --modversion SvtAv1Enc
           pkg-config --cflags --libs SvtAv1Enc
+          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig pkg-config --modversion ffnvcodec
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:
