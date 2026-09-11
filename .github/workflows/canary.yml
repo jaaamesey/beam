@@ -123,16 +123,30 @@ jobs:
       - run: pnpm --dir web install --frozen-lockfile
       - run: pnpm --dir web build
       - run: cargo install cargo-bundle --version 0.11.0 --locked
-      - run: cargo bundle --release
+      - run: cargo bundle --release --format osx
       - name: Verify FFmpeg is statically linked
         run: |
           binary=target/release/bundle/osx/Beam.app/Contents/MacOS/Beam
           dependencies="$(otool -L "$binary")"
           echo "$dependencies"
           ! grep -Eiq 'lib(avcodec|avfilter|avformat|avutil|swscale|x264|x265|SvtAv1Enc).*\.dylib' <<< "$dependencies"
+      - name: Sign and package application
+        run: |
+          app=target/release/bundle/osx/Beam.app
+          dmg=target/release/bundle/dmg/Beam.dmg
+          archive=target/release/bundle/Beam.app.tar.gz
+
+          # cargo-bundle copies a linker-signed executable into the completed app.
+          # Re-sign the completed bundle so Info.plist and resources are sealed.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          mkdir -p "$(dirname "$dmg")"
+          hdiutil create -volname Beam -srcfolder "$app" -ov -format UDZO "$dmg"
+          tar -C "$(dirname "$app")" -czf "$archive" "$(basename "$app")"
       - uses: actions/upload-artifact@v4
         with:
           name: beam-macos-arm64
           path: |
-            target/release/bundle/osx/Beam.app
+            target/release/bundle/Beam.app.tar.gz
             target/release/bundle/dmg/Beam.dmg

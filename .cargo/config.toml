@@ -1,6 +1,8 @@
 [env]
+# ffmpeg-next's `static` feature requests static pkg-config metadata itself.
+# PKG_CONFIG_ALL_STATIC must not be set here: it also affects GTK/DBus and
+# pulls private system dependencies such as libsystemd into Linux links.
 PKG_CONFIG_aarch64_apple_darwin = { value = "scripts/vcpkg-pkg-config", relative = true }
 PKG_CONFIG_x86_64_unknown_linux_gnu = { value = "scripts/vcpkg-pkg-config", relative = true }
-PKG_CONFIG_ALL_STATIC = "1"
 VCPKG_ROOT = { value = ".vcpkg", relative = true, force = true }
 VCPKGRS_TRIPLET = { value = "x64-windows-static-md-release", force = true }
