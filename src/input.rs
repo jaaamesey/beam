@@ -55,17 +55,29 @@ fn run(receiver: Receiver<Vec<u8>>, mut enigo: Option<Enigo>, shutdown: Arc<Atom
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let mut latest_mouse_move = None;
-        for message in std::iter::once(first).chain(receiver.try_iter()) {
-            if is_mouse_move(&message) {
-                latest_mouse_move = Some(message);
-            } else {
-                handle_with_session(&mut enigo, &message);
-            }
-        }
-        if let Some(message) = latest_mouse_move {
+        process_batch(std::iter::once(first).chain(receiver.try_iter()), |message| {
             handle_with_session(&mut enigo, &message);
+        });
+    }
+}
+
+fn process_batch(
+    messages: impl IntoIterator<Item = Vec<u8>>,
+    mut handle: impl FnMut(Vec<u8>),
+) {
+    let mut latest_mouse_move = None;
+    for message in messages {
+        if is_mouse_move(&message) {
+            latest_mouse_move = Some(message);
+        } else {
+            if let Some(message) = latest_mouse_move.take() {
+                handle(message);
+            }
+            handle(message);
         }
+    }
+    if let Some(message) = latest_mouse_move {
+        handle(message);
     }
 }
 
@@ -256,5 +268,26 @@ fn scroll(enigo: &mut Enigo, delta_x: f64, delta_y: f64, delta_mode: u32) {
         && let Err(error) = enigo.scroll(vertical, enigo::Axis::Vertical)
     {
         tracing::warn!(%error, "could not scroll vertically");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_only_consecutive_mouse_moves() {
+        let move_one = br#"{"type":"mouseMove","x":0.1,"y":0.1}"#.to_vec();
+        let move_two = br#"{"type":"mouseMove","x":0.2,"y":0.2}"#.to_vec();
+        let click = br#"{"type":"mouseButton","button":0,"down":true}"#.to_vec();
+        let move_three = br#"{"type":"mouseMove","x":0.3,"y":0.3}"#.to_vec();
+        let mut output = Vec::new();
+
+        process_batch(
+            vec![move_one, move_two.clone(), click.clone(), move_three.clone()],
+            |message| output.push(message),
+        );
+
+        assert_eq!(output, vec![move_two, click, move_three]);
     }
 }

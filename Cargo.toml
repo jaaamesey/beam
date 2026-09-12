@@ -20,7 +20,7 @@ base64 = "0.22"
 bytes = "1"
 dirs = "6"
 display-info = "0.5"
-enigo = { version = "0.6", default-features = false, features = ["libei_tokio"] }
+enigo = { git = "https://github.com/enigo-rs/enigo", rev = "a88d9b7e2cec7043ab5f03e754500a091ea928d1", default-features = false, features = ["libei", "tokio"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 open = "5"
 opus = "0.4"
