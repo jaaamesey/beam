@@ -10,11 +10,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
-    sync::mpsc::Receiver,
 };
 use tao::{
     event::Event,
     event_loop::{ControlFlow, EventLoop},
+    platform::run_return::EventLoopExtRunReturn,
 };
 use tray_icon::{
     Icon, TrayIconBuilder,
@@ -24,8 +24,6 @@ use tray_icon::{
 pub fn run(
     settings_url: String,
     shutdown: Arc<AtomicBool>,
-    input_rx: Receiver<Vec<u8>>,
-    persistent_input: Option<enigo::Enigo>,
 ) -> Result<()> {
     #[allow(unused_mut)] // mutability is only exercised on macOS below
     let mut event_loop = EventLoop::new();
@@ -58,30 +56,8 @@ pub fn run(
 
     let icon = icon()?;
     let mut tray = None;
-    let mut enigo = persistent_input;
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run_return(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2));
-        let mut latest_mouse_move = None;
-        for message in input_rx.try_iter() {
-            if crate::input::is_mouse_move(&message) {
-                latest_mouse_move = Some(message);
-            } else {
-                if enigo.is_none() {
-                    enigo = crate::input::new().ok();
-                }
-                if let Some(enigo) = enigo.as_mut() {
-                    crate::input::handle(enigo, &message);
-                }
-            }
-        }
-        if let Some(message) = latest_mouse_move {
-            if enigo.is_none() {
-                enigo = crate::input::new().ok();
-            }
-            if let Some(enigo) = enigo.as_mut() {
-                crate::input::handle(enigo, &message);
-            }
-        }
         if shutdown.load(Ordering::Relaxed) {
             *control_flow = ControlFlow::Exit;
             return;
@@ -96,7 +72,8 @@ pub fn run(
                     .expect("create tray icon"),
             );
         }
-    })
+    });
+    Ok(())
 }
 
 fn icon() -> Result<Icon> {

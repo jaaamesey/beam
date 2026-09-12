@@ -174,6 +174,7 @@ fn main() -> Result<()> {
     // before starting persistent capture so the input prompt cannot be delayed
     // behind the screen-capture portal session.
     let persistent_input = persistent_sessions.then(input::new).transpose()?;
+    let input_session = input::spawn(input_rx, persistent_input, shutdown_flag.clone());
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
@@ -219,8 +220,9 @@ fn main() -> Result<()> {
     if open_settings && let Err(error) = open::that(&first_settings_url) {
         tracing::warn!(%error, "could not open settings in the browser");
     }
-    let result = tray::run(settings_url, shutdown_flag, input_rx, persistent_input);
+    let result = tray::run(settings_url, shutdown_flag);
     runtime.block_on(app.media.shutdown());
+    input_session.shutdown();
     drop(app);
     drop(runtime);
     result

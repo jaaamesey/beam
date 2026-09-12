@@ -1,7 +1,11 @@
 use display_info::DisplayInfo;
 use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
-use std::{cell::RefCell, sync::OnceLock};
+use std::{
+    cell::RefCell,
+    sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}, mpsc::Receiver},
+    time::Duration,
+};
 
 thread_local! {
     static SCROLL_REMAINDER: RefCell<(f64, f64)> = const { RefCell::new((0.0, 0.0)) };
@@ -16,6 +20,63 @@ struct DisplayBounds {
 }
 
 static PRIMARY_DISPLAY: OnceLock<Option<DisplayBounds>> = OnceLock::new();
+
+pub struct Session {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Session {
+    pub fn shutdown(mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn spawn(
+    receiver: Receiver<Vec<u8>>,
+    initial: Option<Enigo>,
+    shutdown: Arc<AtomicBool>,
+) -> Session {
+    let thread_shutdown = shutdown.clone();
+    let thread = std::thread::Builder::new()
+        .name("beam-input".into())
+        .spawn(move || run(receiver, initial, thread_shutdown))
+        .expect("input thread");
+    Session { shutdown, thread: Some(thread) }
+}
+
+fn run(receiver: Receiver<Vec<u8>>, mut enigo: Option<Enigo>, shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::Relaxed) {
+        let first = match receiver.recv_timeout(Duration::from_millis(2)) {
+            Ok(message) => message,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let mut latest_mouse_move = None;
+        for message in std::iter::once(first).chain(receiver.try_iter()) {
+            if is_mouse_move(&message) {
+                latest_mouse_move = Some(message);
+            } else {
+                handle_with_session(&mut enigo, &message);
+            }
+        }
+        if let Some(message) = latest_mouse_move {
+            handle_with_session(&mut enigo, &message);
+        }
+    }
+}
+
+fn handle_with_session(enigo: &mut Option<Enigo>, message: &[u8]) {
+    if enigo.is_none() {
+        *enigo = new().map_err(|error| tracing::error!(%error, "could not initialise native input")).ok();
+    }
+    if let Some(enigo) = enigo.as_mut() {
+        handle(enigo, message);
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
