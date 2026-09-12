@@ -15,6 +15,33 @@ use super::{Codec, EncodedFrame, LatestFrame, RawFrame, FPS, next_frame};
 
 static FFMPEG_INIT: OnceLock<bool> = OnceLock::new();
 
+#[derive(Default)]
+struct TimingTotals {
+    frames: u64,
+    conversion: Duration,
+    submit: Duration,
+    drain: Duration,
+    egress: Duration,
+}
+
+impl TimingTotals {
+    fn report(&mut self) {
+        if self.frames == 0 {
+            return;
+        }
+        let frames = self.frames as f64;
+        tracing::info!(
+            frames = self.frames,
+            conversion_ms = self.conversion.as_secs_f64() * 1000.0 / frames,
+            submit_ms = self.submit.as_secs_f64() * 1000.0 / frames,
+            drain_ms = self.drain.as_secs_f64() * 1000.0 / frames,
+            egress_ms = self.egress.as_secs_f64() * 1000.0 / frames,
+            "video pipeline timing"
+        );
+        *self = Self::default();
+    }
+}
+
 pub(crate) fn hardware_codecs() -> super::HardwareCodecAvailability {
     let _ = initialize();
     super::HardwareCodecAvailability {
@@ -44,7 +71,7 @@ pub(super) fn encode(
         format::Pixel::BGRA,
         first.width as u32,
         first.height as u32,
-        format::Pixel::YUV420P,
+        encoder.pixel,
         scaled_width as u32,
         scaled_height as u32,
         Flags::FAST_BILINEAR,
@@ -54,6 +81,7 @@ pub(super) fn encode(
     let mut source = Some(first);
     let mut submissions: VecDeque<(i64, Instant)> = VecDeque::new();
     let mut next_pts = 0i64;
+    let mut timings = TimingTotals::default();
     // FFmpeg encoders are pipelined: keep feeding frames and drain whatever
     // is ready. Waiting for one packet before feeding the next can deadlock
     // encoders that need multiple input frames before producing output.
@@ -62,6 +90,7 @@ pub(super) fn encode(
         let Some(source) = source.take().or_else(|| next_frame(&frames)) else {
             return Ok(());
         };
+        let conversion_start = Instant::now();
         let mut video = yuv_frame(
             &source,
             width,
@@ -69,7 +98,9 @@ pub(super) fn encode(
             scaled_width,
             scaled_height,
             &mut scaler,
+            encoder.pixel,
         )?;
+        timings.conversion += conversion_start.elapsed();
         video.set_pts(Some(next_pts));
         let duration = previous_time
             .and_then(|time| source.captured_at.duration_since(time).ok())
@@ -78,12 +109,18 @@ pub(super) fn encode(
         previous_time = Some(source.captured_at);
         submissions.push_back((next_pts, Instant::now()));
         next_pts += 1;
+        let submit_start = Instant::now();
         encoder
             .context
             .send_frame(&video)
             .context("queue FFmpeg video frame")?;
-        if !drain_packets(&mut encoder.context, &mut submissions, &sender, &mut primed, duration)? {
+        timings.submit += submit_start.elapsed();
+        timings.frames += 1;
+        if !drain_packets(&mut encoder.context, &mut submissions, &sender, &mut primed, duration, &mut timings)? {
             return Ok(());
+        }
+        if timings.frames >= FPS as u64 {
+            timings.report();
         }
     }
 }
@@ -94,7 +131,10 @@ fn drain_packets(
     sender: &mpsc::Sender<EncodedFrame>,
     primed: &mut bool,
     duration: Duration,
+    timings: &mut TimingTotals,
 ) -> Result<bool> {
+    let drain_start = Instant::now();
+    let mut egress = Duration::ZERO;
     let mut packet = ffmpeg::Packet::empty();
     let mut had_packets = false;
     while encoder.receive_packet(&mut packet).is_ok() {
@@ -117,6 +157,7 @@ fn drain_packets(
         } else {
             Duration::ZERO
         };
+        let egress_start = Instant::now();
         if sender
             .blocking_send(EncodedFrame {
                 data: data.to_vec(),
@@ -127,9 +168,12 @@ fn drain_packets(
         {
             return Ok(false);
         }
+        egress += egress_start.elapsed();
         had_packets = true;
         packet = ffmpeg::Packet::empty();
     }
+    timings.drain += drain_start.elapsed().saturating_sub(egress);
+    timings.egress += egress;
     *primed |= had_packets;
     Ok(true)
 }
@@ -170,6 +214,7 @@ struct Encoder {
     context: encoder::Video,
     name: &'static str,
     hardware: bool,
+    pixel: format::Pixel,
 }
 
 impl Encoder {
@@ -186,7 +231,12 @@ impl Encoder {
                 .encoder().video().context("create FFmpeg video context")?;
             video.set_width(width as u32);
             video.set_height(height as u32);
-            video.set_format(format::Pixel::YUV420P);
+            let pixel = if hardware.contains(&name) {
+                format::Pixel::NV12
+            } else {
+                format::Pixel::YUV420P
+            };
+            video.set_format(pixel);
             video.set_time_base(Rational::new(1, FPS as i32));
             video.set_frame_rate(Some(Rational::new(FPS as i32, 1)));
             video.set_bit_rate(bitrate as usize);
@@ -200,7 +250,7 @@ impl Encoder {
                     if !hardware.contains(&name) {
                         tracing::warn!(codec = ?codec, encoder = name, "hardware FFmpeg encoder unavailable; falling back to software");
                     }
-                    return Ok(Self { context, name, hardware: hardware.contains(&name) });
+                    return Ok(Self { context, name, hardware: hardware.contains(&name), pixel });
                 }
                 Err(error) => {
                     if hardware.contains(&name) {
@@ -269,6 +319,7 @@ fn yuv_frame(
     scaled_width: usize,
     scaled_height: usize,
     scaler: &mut ScalingContext,
+    pixel: format::Pixel,
 ) -> Result<frame::Video> {
     let mut input =
         frame::Video::new(format::Pixel::BGRA, source.width as u32, source.height as u32);
@@ -282,7 +333,7 @@ fn yuv_frame(
     }
 
     let mut scaled = frame::Video::new(
-        format::Pixel::YUV420P,
+        pixel,
         scaled_width as u32,
         scaled_height as u32,
     );
@@ -293,10 +344,9 @@ fn yuv_frame(
         return Ok(scaled);
     }
 
-    let mut output = frame::Video::new(format::Pixel::YUV420P, width as u32, height as u32);
+    let mut output = frame::Video::new(pixel, width as u32, height as u32);
     output.data_mut(0).fill(16);
     output.data_mut(1).fill(128);
-    output.data_mut(2).fill(128);
     let left = (width - scaled_width) / 2;
     let top = (height - scaled_height) / 2;
     copy_plane(
@@ -308,24 +358,13 @@ fn yuv_frame(
         scaled_width,
         scaled_height,
     );
-    copy_plane(
-        &mut output,
-        &scaled,
-        1,
-        left / 2,
-        top / 2,
-        scaled_width / 2,
-        scaled_height / 2,
-    );
-    copy_plane(
-        &mut output,
-        &scaled,
-        2,
-        left / 2,
-        top / 2,
-        scaled_width / 2,
-        scaled_height / 2,
-    );
+    if pixel == format::Pixel::NV12 {
+        copy_plane(&mut output, &scaled, 1, left, top / 2, scaled_width, scaled_height / 2);
+    } else {
+        output.data_mut(2).fill(128);
+        copy_plane(&mut output, &scaled, 1, left / 2, top / 2, scaled_width / 2, scaled_height / 2);
+        copy_plane(&mut output, &scaled, 2, left / 2, top / 2, scaled_width / 2, scaled_height / 2);
+    }
     Ok(output)
 }
 
@@ -348,4 +387,77 @@ fn copy_plane(
         target_data[target_start..target_start + width]
             .copy_from_slice(&source_data[source_start..source_start + width]);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+    #[test]
+    fn timing_totals_report_resets_the_window() {
+        let mut totals = TimingTotals {
+            frames: FPS as u64,
+            conversion: Duration::from_millis(60),
+            submit: Duration::from_millis(30),
+            drain: Duration::from_millis(90),
+            egress: Duration::from_millis(15),
+        };
+        totals.report();
+        assert_eq!(totals.frames, 0);
+        assert_eq!(totals.conversion, Duration::ZERO);
+        assert_eq!(totals.egress, Duration::ZERO);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_hardware_input_formats() {
+        initialize().unwrap();
+        let width = 1920;
+        let height = 1080;
+        let source = RawFrame {
+            bgra: vec![0; width * height * 4],
+            width,
+            height,
+            stride: width * 4,
+            captured_at: SystemTime::now(),
+        };
+        let mut yuv_scaler = ScalingContext::get(
+            format::Pixel::BGRA,
+            width as u32,
+            height as u32,
+            format::Pixel::YUV420P,
+            width as u32,
+            height as u32,
+            Flags::FAST_BILINEAR,
+        )
+        .unwrap();
+        let mut nv12_scaler = ScalingContext::get(
+            format::Pixel::BGRA,
+            width as u32,
+            height as u32,
+            format::Pixel::NV12,
+            width as u32,
+            height as u32,
+            Flags::FAST_BILINEAR,
+        )
+        .unwrap();
+        let iterations = 100;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(yuv_frame(&source, width, height, width, height, &mut yuv_scaler, format::Pixel::YUV420P).unwrap());
+        }
+        let yuv_elapsed = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(yuv_frame(&source, width, height, width, height, &mut nv12_scaler, format::Pixel::NV12).unwrap());
+        }
+        let nv12_elapsed = start.elapsed();
+        println!(
+            "input format benchmark: yuv420p={:.2}ms/frame nv12={:.2}ms/frame speedup={:.1}%",
+            yuv_elapsed.as_secs_f64() * 1000.0 / iterations as f64,
+            nv12_elapsed.as_secs_f64() * 1000.0 / iterations as f64,
+            (1.0 - nv12_elapsed.as_secs_f64() / yuv_elapsed.as_secs_f64()) * 100.0,
+        );
+    }
+
 }
