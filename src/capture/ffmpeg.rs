@@ -131,6 +131,10 @@ fn set_low_latency_options(name: &str, options: &mut Dictionary) {
             options.set("preset", "ultrafast");
             options.set("tune", "zerolatency");
         }
+        "libx265" => {
+            options.set("preset", "ultrafast");
+            options.set("tune", "zerolatency");
+        }
         "libsvtav1" => {
             // SVT presets run from 0 (slowest) through 13 (fastest).
             options.set("preset", "13");
@@ -145,6 +149,10 @@ fn set_low_latency_options(name: &str, options: &mut Dictionary) {
         name if name.ends_with("_amf") => {
             options.set("usage", "ultralowlatency");
             options.set("quality", "speed");
+        }
+        name if name.ends_with("_videotoolbox") => {
+            options.set("realtime", "1");
+            options.set("max_ref_frames", "1");
         }
         _ => {}
     }

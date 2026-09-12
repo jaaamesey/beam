@@ -28,14 +28,16 @@ use hyper_util::{
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    io::{self, Write},
     net::{SocketAddr, UdpSocket},
-        sync::{
+    sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        },
-        path::PathBuf,
-        time::{Duration, Instant},
+        Mutex,
+    },
+    path::PathBuf,
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -48,6 +50,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use tracing_subscriber::fmt::MakeWriter;
 
 const PORT: u16 = 9470;
 const COOKIE: &str = "beam_session";
@@ -59,6 +62,42 @@ struct App {
     media: Arc<rtc::Media>,
     shutdown: Arc<AtomicBool>,
     network_address: String,
+    logs: LogBuffer,
+}
+
+const MAX_LOG_BYTES: usize = 100_000;
+
+#[derive(Clone, Default)]
+struct LogBuffer {
+    bytes: Arc<Mutex<VecDeque<u8>>>,
+}
+
+struct LogWriter {
+    logs: LogBuffer,
+}
+
+impl<'a> MakeWriter<'a> for LogBuffer {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter { logs: self.clone() }
+    }
+}
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::stderr().write_all(bytes)?;
+        let mut log = self.logs.bytes.lock().unwrap();
+        log.extend(bytes);
+        while log.len() > MAX_LOG_BYTES {
+            log.pop_front();
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -72,19 +111,27 @@ struct Settings {
     address: String,
 }
 
+#[derive(Serialize)]
+struct Logs {
+    logs: String,
+}
+
 #[derive(Deserialize)]
 struct Offer {
     sdp: String,
 }
 
 fn main() -> Result<()> {
+    let logs = LogBuffer::default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("beam=info".parse()?),
         )
+        .with_writer(logs.clone())
         .init();
 
     input::check_permissions();
+    capture::check_permissions();
 
     let runtime = tokio::runtime::Runtime::new()?;
     let listener = runtime.block_on(TcpListener::bind(("0.0.0.0", PORT)))?;
@@ -93,6 +140,7 @@ fn main() -> Result<()> {
     let network_address = format!("http://{}:{PORT}", local_ip());
     let open_settings = !Config::settings_opened()?;
     let settings_url = format!("https://127.0.0.1:{PORT}/settings#{}", config.admin_token);
+    let first_settings_url = settings_url.replacen("https://", "http://", 1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     let app = Arc::new(App {
@@ -101,26 +149,41 @@ fn main() -> Result<()> {
         media: rtc::Media::new(input_tx)?,
         shutdown: shutdown_flag.clone(),
         network_address,
+        logs,
     });
 
     let web_root = resource_path("web/dist");
-    let files = ServeDir::new(&web_root)
-        .not_found_service(ServeFile::new(web_root.join("index.html")));
     let secure = Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", post(login))
         .route("/api/offer", post(offer))
         .route("/api/admin/settings", get(get_settings).put(put_settings))
+        .route("/api/admin/logs", get(get_logs))
         .route("/api/admin/settings-opened", post(settings_opened))
         .route("/api/admin/shutdown", post(shutdown))
-        .fallback_service(files)
+        .fallback_service(
+            ServeDir::new(&web_root).not_found_service(ServeFile::new(web_root.join("index.html"))),
+        )
         .layer(TraceLayer::new_for_http())
-        .with_state(app);
-    let welcome = Router::new().fallback(welcome);
+        .with_state(app.clone());
+    let welcome_router = if open_settings {
+        Router::new()
+            .route("/api/admin/settings", get(get_settings).put(put_settings))
+            .route("/api/admin/logs", get(get_logs))
+            .route("/api/admin/settings-opened", post(settings_opened))
+            .route("/api/admin/shutdown", post(shutdown))
+            .fallback_service(
+                ServeDir::new(&web_root)
+                    .not_found_service(ServeFile::new(web_root.join("index.html"))),
+            )
+            .with_state(app.clone())
+    } else {
+        Router::new().fallback(welcome).with_state(app.clone())
+    };
     let tls = tls::acceptor()?;
-    runtime.spawn(run_server(listener, tls, secure, welcome));
+    runtime.spawn(run_server(listener, tls, secure, welcome_router));
     tracing::info!(address = %bound_address, "Beam is ready");
-    if open_settings && let Err(error) = open::that(&settings_url) {
+    if open_settings && let Err(error) = open::that(&first_settings_url) {
         tracing::warn!(%error, "could not open settings in the browser");
     }
     tray::run(settings_url, shutdown_flag, input_rx)
@@ -271,6 +334,18 @@ async fn get_settings(
     Ok(Json(Settings {
         password: app.config.read().await.password.clone(),
         address: app.network_address.clone(),
+    }))
+}
+
+async fn get_logs(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<Logs>> {
+    require_admin(&app, address, &headers).await?;
+    let bytes: Vec<u8> = app.logs.bytes.lock().unwrap().iter().copied().collect();
+    Ok(Json(Logs {
+        logs: String::from_utf8_lossy(&bytes).into_owned(),
     }))
 }
 

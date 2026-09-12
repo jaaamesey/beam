@@ -77,20 +77,29 @@ function Viewer() {
   const [bitrate, setBitrate] = useState<number | null>(null)
   const [hostMouseVisible, setHostMouseVisible] = useState<boolean | null>(null)
   const [hardwareCodecs, setHardwareCodecs] = useState<HardwareCodecs | null>(null)
-
   async function toggleFullscreen() {
-    if (document.fullscreenElement) {
-      await document.exitFullscreen()
+    const fullscreenDocument = document as Document & {
+      webkitFullscreenElement?: Element
+      webkitExitFullscreen?: () => Promise<void> | void
+    }
+    const fullscreenElement = document.fullscreenElement ?? fullscreenDocument.webkitFullscreenElement
+    if (fullscreenElement) {
+      if (document.exitFullscreen) await document.exitFullscreen()
+      else await fullscreenDocument.webkitExitFullscreen?.()
       unlockKeyboard()
     } else {
       const element = player.current
       if (!element) return
+      const fullscreenElement = element as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void> | void
+      }
       try {
-        await (element.requestFullscreen as (options?: { keyboardLock?: 'browser' }) => Promise<void>)({
+        await (element.requestFullscreen as (options?: { keyboardLock?: 'browser' }) => Promise<void>)?.({
           keyboardLock: 'browser',
         })
       } catch {
-        await element.requestFullscreen()
+        if (element.requestFullscreen) await element.requestFullscreen()
+        else await fullscreenElement.webkitRequestFullscreen?.()
       }
       const keyboard = (navigator as Navigator & {
         keyboard?: { lock?: (keys?: string[]) => Promise<void> }
@@ -105,11 +114,18 @@ function Viewer() {
 
   useEffect(() => {
     const update = () => {
-      setFullscreen(document.fullscreenElement === player.current)
-      if (!document.fullscreenElement) unlockKeyboard()
+      const fullscreenDocument = document as Document & { webkitFullscreenElement?: Element }
+      const fullscreenElement = document.fullscreenElement ?? fullscreenDocument.webkitFullscreenElement
+      const playerIsFullscreen = fullscreenElement === player.current
+      setFullscreen(playerIsFullscreen)
+      if (!fullscreenElement) unlockKeyboard()
     }
     document.addEventListener('fullscreenchange', update)
-    return () => document.removeEventListener('fullscreenchange', update)
+    document.addEventListener('webkitfullscreenchange', update)
+    return () => {
+      document.removeEventListener('fullscreenchange', update)
+      document.removeEventListener('webkitfullscreenchange', update)
+    }
   }, [])
 
   function unlockKeyboard() {
@@ -367,6 +383,7 @@ function SettingsPage() {
   const [showPassword, setShowPassword] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [status, setStatus] = useState('Loading…')
+  const [logs, setLogs] = useState('')
 
   useEffect(() => {
     history.replaceState(null, '', location.pathname + location.search)
@@ -379,7 +396,7 @@ function SettingsPage() {
         localStorage.setItem(ADMIN_TOKEN, token)
         setPassword(value.password)
         setAddress(value.address)
-        setStatus('Saved on this Mac')
+        setStatus('Saved.')
         setAuthorized(true)
         return json('/api/admin/settings-opened', {
           method: 'POST', headers: { authorization: `Bearer ${token}` },
@@ -394,6 +411,24 @@ function SettingsPage() {
         }
       })
   }, [token])
+
+  useEffect(() => {
+    if (authorized !== true) return
+    let active = true
+    const refresh = () => {
+      void json<{ logs: string }>('/api/admin/logs', {
+        headers: { authorization: `Bearer ${token}` },
+      }).then(value => {
+        if (active) setLogs(value.logs)
+      }).catch(() => {})
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 2000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [authorized, token])
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
@@ -463,6 +498,10 @@ function SettingsPage() {
             <span className="text-sm text-slate-400">{status}</span>
           </div>
         </form>
+        <section className="mt-8 border-t border-white/10 pt-6">
+          <h2 className="text-xl font-semibold tracking-tight">Application log</h2>
+          <pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-black/40 p-4 font-mono text-xs leading-5 text-slate-300">{logs || 'No log output yet.'}</pre>
+        </section>
         <div className="mt-8 border-t border-white/10 pt-6">
           <button type="button" onClick={shutdown} disabled={stopping}
             className="rounded-xl border border-red-400/30 px-5 py-2.5 font-semibold text-red-300 hover:bg-red-400/10 disabled:opacity-50">

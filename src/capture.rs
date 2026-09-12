@@ -12,6 +12,14 @@ use tokio::sync::mpsc;
 
 pub(crate) mod ffmpeg;
 
+pub fn check_permissions() {
+    #[cfg(target_os = "macos")]
+    match pinray::enumerate_sources() {
+        Ok(_) => tracing::info!("screen recording permission is available"),
+        Err(error) => tracing::warn!(%error, "screen recording permission is unavailable"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
@@ -28,7 +36,7 @@ pub struct HardwareCodecAvailability {
 }
 
 pub const CODEC: Codec = Codec::H264;
-pub const FPS: u32 = 30;
+pub const FPS: u32 = 60;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
