@@ -20,7 +20,7 @@ base64 = "0.22"
 bytes = "1"
 dirs = "6"
 display-info = "0.5"
-enigo = { version = "0.2", features = ["wayland", "libei"] }
+enigo = { version = "0.6", default-features = false, features = ["libei_tokio"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 open = "5"
 opus = "0.4"

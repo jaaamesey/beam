@@ -31,6 +31,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, Write},
     net::{SocketAddr, UdpSocket},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -54,6 +55,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 const PORT: u16 = 9470;
 const COOKIE: &str = "beam_session";
+const RESTART_CHILD: &str = "--beam-restart-child";
 type HttpResult<T> = Result<T, (StatusCode, String)>;
 
 struct App {
@@ -129,6 +131,26 @@ struct Offer {
 }
 
 fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|argument| argument == RESTART_CHILD) {
+        wait_for_port(PORT);
+        return replace_process(arguments.into_iter().skip(1).collect());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-restarted") {
+        println!("restart self-test passed: second process generation started");
+        return Ok(());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-watcher-restarted") {
+        println!("restart watcher self-test passed: second process generation started");
+        return Ok(());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-watcher") {
+        spawn_restart_watcher()?;
+        return Ok(());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-restart") {
+        return restart_process_with_args(["--beam-self-test-restarted"]);
+    }
     let logs = LogBuffer::default();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -148,6 +170,10 @@ fn main() -> Result<()> {
     let first_settings_url = settings_url.replacen("https://", "http://", 1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let (input_tx, input_rx) = std::sync::mpsc::channel();
+    // Linux portals serialize permission requests. Establish persistent input
+    // before starting persistent capture so the input prompt cannot be delayed
+    // behind the screen-capture portal session.
+    let persistent_input = persistent_sessions.then(input::new).transpose()?;
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
@@ -166,6 +192,7 @@ fn main() -> Result<()> {
         .route("/api/admin/logs", get(get_logs))
         .route("/api/admin/settings-opened", post(settings_opened))
         .route("/api/admin/shutdown", post(shutdown))
+        .route("/api/admin/restart", post(restart))
         .fallback_service(
             ServeDir::new(&web_root).not_found_service(ServeFile::new(web_root.join("index.html"))),
         )
@@ -177,6 +204,7 @@ fn main() -> Result<()> {
             .route("/api/admin/logs", get(get_logs))
             .route("/api/admin/settings-opened", post(settings_opened))
             .route("/api/admin/shutdown", post(shutdown))
+            .route("/api/admin/restart", post(restart))
             .fallback_service(
                 ServeDir::new(&web_root)
                     .not_found_service(ServeFile::new(web_root.join("index.html"))),
@@ -191,9 +219,63 @@ fn main() -> Result<()> {
     if open_settings && let Err(error) = open::that(&first_settings_url) {
         tracing::warn!(%error, "could not open settings in the browser");
     }
-    let result = tray::run(settings_url, shutdown_flag, input_rx, persistent_sessions);
+    let result = tray::run(settings_url, shutdown_flag, input_rx, persistent_input);
     runtime.block_on(app.media.shutdown());
+    drop(app);
+    drop(runtime);
     result
+}
+
+pub(crate) fn spawn_restart_watcher() -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg(RESTART_CHILD)
+        .args(std::env::args_os().skip(1));
+    if std::env::args().any(|argument| argument == "--beam-self-test-watcher") {
+        command.arg("--beam-self-test-watcher-restarted");
+    }
+    command
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("start Beam restart watcher: {error}"))?;
+    Ok(())
+}
+
+fn wait_for_port(port: u16) {
+    while std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn restart_process_with_args<const N: usize>(extra_args: [&str; N]) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    command.args(extra_args);
+    replace_command(command)
+}
+
+fn replace_process(arguments: Vec<std::ffi::OsString>) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command.args(arguments);
+    replace_command(command)
+}
+
+fn replace_command(mut command: Command) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        return Err(anyhow::anyhow!("restart Beam server: {error}"));
+    }
+    #[cfg(not(unix))]
+    {
+        command
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("restart Beam server: {error}"))?;
+        Ok(())
+    }
 }
 
 fn resource_path(relative: &str) -> PathBuf {
@@ -396,6 +478,21 @@ async fn shutdown(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn restart(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<serde_json::Value>> {
+    require_admin(&app, address, &headers).await?;
+    spawn_restart_watcher().map_err(internal)?;
+    let shutdown = app.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.store(true, Ordering::Relaxed);
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 async fn settings_opened(
     State(app): State<Arc<App>>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
@@ -485,5 +582,19 @@ mod tests {
                 .0,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[test]
+    fn restart_waits_until_the_server_port_is_released() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(listener);
+        });
+        let started = Instant::now();
+        wait_for_port(port);
+        release.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 }

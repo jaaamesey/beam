@@ -187,6 +187,7 @@ function Viewer() {
       pc.addTransceiver('video', { direction: 'recvonly' })
       pc.addTransceiver('audio', { direction: 'recvonly' })
       const input = pc.createDataChannel('input')
+      const pointer = pc.createDataChannel('pointer', { ordered: false, maxRetransmits: 0 })
       inputChannel.current = input
       input.onmessage = event => {
         if (generation !== connectionGeneration.current) return
@@ -303,14 +304,14 @@ function Viewer() {
             if (event.pointerType && event.pointerType !== 'mouse') return
             if (document.fullscreenElement !== player.current) return
             const position = streamPosition(video.current!, event.clientX, event.clientY)
-            if (position && input.readyState === 'open')
-              input.send(JSON.stringify({ type: 'mouseMove', ...position }))
+            if (position && pointer.readyState === 'open')
+              pointer.send(JSON.stringify({ type: 'mouseMove', ...position }))
           }
           video.current.onwheel = event => {
             if (document.fullscreenElement !== player.current) return
             event.preventDefault()
-            if (input.readyState === 'open')
-              input.send(JSON.stringify({
+            if (pointer.readyState === 'open')
+              pointer.send(JSON.stringify({
                 type: 'wheel', deltaX: event.deltaX, deltaY: event.deltaY, deltaMode: event.deltaMode,
               }))
           }
@@ -461,6 +462,7 @@ function SettingsPage() {
   const [persistentSessions, setPersistentSessions] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const [restarting, setRestarting] = useState(false)
   const [status, setStatus] = useState('Loading…')
   const [logs, setLogs] = useState('')
 
@@ -538,6 +540,19 @@ function SettingsPage() {
     }
   }
 
+  async function restart() {
+    if (!confirm('Restart Beam server?')) return
+    setRestarting(true)
+    try {
+      await json('/api/admin/restart', { method: 'POST', headers: { authorization: `Bearer ${token}` } })
+      setStatus('Restarting Beam…')
+      window.setTimeout(() => window.location.reload(), 1500)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not restart Beam')
+      setRestarting(false)
+    }
+  }
+
   if (authorized !== true) return (
     <Shell>
       <section className="max-w-xl rounded-3xl border border-white/10 bg-white/[.04] p-7 shadow-2xl">
@@ -555,11 +570,10 @@ function SettingsPage() {
     <Shell>
       <section className="max-w-xl rounded-3xl border border-white/10 bg-white/[.04] p-7 shadow-2xl">
         <p className="mb-2 text-xs font-semibold uppercase tracking-[.2em] text-cyan-300">Host settings</p>
-        <h1 className="text-3xl font-semibold tracking-tight">Who can connect?</h1>
         <p className="mt-4 rounded-xl bg-black/20 px-4 py-3 text-sm text-slate-300">
           Devices on your network can connect to this computer at <a className="font-mono text-cyan-300 hover:underline" href={address}>{address}</a>
         </p>
-        <form onSubmit={save} className="mt-8">
+        <form id="host-settings" onSubmit={save} className="mt-8">
           <label className="mb-2 block text-sm font-medium" htmlFor="password">Client password</label>
           <div className="relative">
             <input id="password" type={showPassword ? 'text' : 'password'} value={password}
@@ -573,19 +587,14 @@ function SettingsPage() {
               </svg>
             </button>
           </div>
-          <div className="mt-5 flex items-center gap-4">
-            <button className="rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Save password</button>
-            <span className="text-sm text-slate-400">{status}</span>
-          </div>
         </form>
         <section className="mt-8 border-t border-white/10 pt-6">
-          <h2 className="text-xl font-semibold tracking-tight">Permissions</h2>
           <label className="mt-4 flex items-start gap-3 text-sm text-slate-300">
             <input type="checkbox" checked={persistentSessions}
               onChange={event => setPersistentSessions(event.target.checked)} className="mt-1 size-4" />
             <span>
               <span className="block font-medium text-white">Keep capture and input sessions persistent</span>
-              <span className="mt-1 block text-slate-400">Request capture and input permissions at startup and reuse the sessions across reconnects. Recommended on Linux which is more aggressive about asking for those permissions. May use more energy.</span>
+              <span className="mt-1 block text-slate-400">Request capture and input permissions at startup and reuse the sessions across reconnects. Recommended on Linux which is more aggressive about asking for those permissions. May use more energy. Requires a restart.</span>
             </span>
           </label>
         </section>
@@ -593,11 +602,21 @@ function SettingsPage() {
           <h2 className="text-xl font-semibold tracking-tight">Application log</h2>
           <pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-black/40 p-4 font-mono text-xs leading-5 text-slate-300">{logs || 'No log output yet.'}</pre>
         </section>
+        <div className="mt-8 flex items-center gap-4 border-t border-white/10 pt-6">
+          <button type="submit" form="host-settings" className="rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Save all settings</button>
+          <span className="text-sm text-slate-400">{status}</span>
+        </div>
         <div className="mt-8 border-t border-white/10 pt-6">
-          <button type="button" onClick={shutdown} disabled={stopping}
+          <div className="flex flex-wrap gap-3">
+          <button type="button" onClick={restart} disabled={stopping || restarting}
+            className="rounded-xl border border-amber-300/30 px-5 py-2.5 font-semibold text-amber-200 hover:bg-amber-300/10 disabled:opacity-50">
+            {restarting ? 'Restarting…' : 'Restart Beam server'}
+          </button>
+          <button type="button" onClick={shutdown} disabled={stopping || restarting}
             className="rounded-xl border border-red-400/30 px-5 py-2.5 font-semibold text-red-300 hover:bg-red-400/10 disabled:opacity-50">
             {stopping ? 'Stopping…' : 'Stop Beam server'}
           </button>
+          </div>
         </div>
       </section>
     </Shell>

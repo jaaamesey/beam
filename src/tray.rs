@@ -25,7 +25,7 @@ pub fn run(
     settings_url: String,
     shutdown: Arc<AtomicBool>,
     input_rx: Receiver<Vec<u8>>,
-    persistent_sessions: bool,
+    persistent_input: Option<enigo::Enigo>,
 ) -> Result<()> {
     #[allow(unused_mut)] // mutability is only exercised on macOS below
     let mut event_loop = EventLoop::new();
@@ -35,15 +35,21 @@ pub fn run(
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
     let open = MenuItem::new("Open Beam Settings", true, None);
+    let restart_item = MenuItem::new("Restart Beam Server", true, None);
     let quit = MenuItem::new("Quit Beam", true, None);
     let separator = PredefinedMenuItem::separator();
-    let menu = Menu::with_items(&[&open, &separator, &quit])?;
-    let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
+    let menu = Menu::with_items(&[&open, &restart_item, &separator, &quit])?;
+    let (open_id, restart_id, quit_id) = (open.id().clone(), restart_item.id().clone(), quit.id().clone());
     let menu_shutdown = shutdown.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id == open_id {
             if let Err(error) = open::that(&settings_url) {
                 tracing::warn!(%error, "could not open settings in the browser");
+            }
+        } else if event.id == restart_id {
+            match crate::spawn_restart_watcher() {
+                Ok(()) => menu_shutdown.store(true, Ordering::Relaxed),
+                Err(error) => tracing::error!(%error, "could not start Beam restart watcher"),
             }
         } else if event.id == quit_id {
             menu_shutdown.store(true, Ordering::Relaxed);
@@ -52,11 +58,7 @@ pub fn run(
 
     let icon = icon()?;
     let mut tray = None;
-    let mut enigo = if persistent_sessions {
-        Some(crate::input::new()?)
-    } else {
-        None
-    };
+    let mut enigo = persistent_input;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2));
         let mut latest_mouse_move = None;

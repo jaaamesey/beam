@@ -156,10 +156,19 @@ impl Media {
             let settings = settings.clone();
             let encode_duration_us = encode_duration_us.clone();
             Box::pin(async move {
-                if channel.label() != "input" {
+                if channel.label() != "input" && channel.label() != "pointer" {
                     return;
                 }
-                tracing::info!("input data channel connected");
+                tracing::info!(label = channel.label(), "input data channel connected");
+                if channel.label() == "pointer" {
+                    channel.on_message(Box::new(move |message: DataChannelMessage| {
+                        let input_tx = input_tx.clone();
+                        Box::pin(async move {
+                            let _ = input_tx.send(message.data.to_vec());
+                        })
+                    }));
+                    return;
+                }
                 let open_channel = channel.clone();
                 let open_settings = settings.clone();
                 channel.on_open(Box::new(move || {
