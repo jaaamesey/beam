@@ -49,3 +49,8 @@ ffmpeg-next = { version = "9", default-features = false, features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = "0.0.2"
+
+[patch.crates-io]
+# VideoToolbox emits IDR_N_LP (NAL type 20), which the released payloader
+# incorrectly discarded.
+rtp = { path = "vendor/rtp" }

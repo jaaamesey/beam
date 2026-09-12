@@ -174,7 +174,10 @@ jobs:
           cp -R "$app" "$staging/Beam.app"
           ln -s /Applications "$staging/Applications"
           mkdir -p "$(dirname "$dmg")"
-          hdiutil create -volname Beam -srcfolder "$staging" -ov -format UDZO "$dmg"
+          temporary_dmg="$dmg.tmp"
+          rm -f "$temporary_dmg"
+          hdiutil create -volname Beam -srcfolder "$staging" -ov -format UDZO "$temporary_dmg"
+          mv -f "$temporary_dmg" "$dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: beam-macos-arm64
