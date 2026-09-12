@@ -29,6 +29,7 @@ pub struct Media {
     settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
     active_session: Arc<tokio::sync::Mutex<Option<ActiveSession>>>,
     persistent_source: Arc<tokio::sync::Mutex<Option<Arc<capture::SourceSession>>>>,
+    persistent_sessions: bool,
     hardware_codecs: capture::HardwareCodecAvailability,
     encode_duration_us: Arc<AtomicU64>,
 }
@@ -114,6 +115,7 @@ impl Media {
             persistent_source: Arc::new(tokio::sync::Mutex::new(
                 persistent_sessions.then(|| capture::spawn_source(Default::default())),
             )),
+            persistent_sessions,
             hardware_codecs: capture::ffmpeg::hardware_codecs(),
             encode_duration_us: Arc::new(AtomicU64::new(0)),
         });
@@ -287,6 +289,7 @@ impl Media {
             self.encode_duration_us.clone(),
             shutdown_rx,
             self.persistent_source.clone(),
+            self.persistent_sessions,
         ));
         Ok(answer)
     }
@@ -310,6 +313,7 @@ async fn run_session(
     encode_duration_us: Arc<AtomicU64>,
     mut shutdown: oneshot::Receiver<()>,
     persistent_source: Arc<tokio::sync::Mutex<Option<Arc<capture::SourceSession>>>>,
+    persistent_sessions: bool,
 ) {
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -334,12 +338,15 @@ async fn run_session(
         return;
     }
 
-    let source = if let Some(source) = persistent_source.lock().await.clone() {
-        source
+    let source = if persistent_sessions {
+        let mut cached = persistent_source.lock().await;
+        if cached.as_ref().is_none_or(|source| source.is_closed()) {
+            *cached = Some(capture::spawn_source(settings));
+        }
+        cached.as_ref().unwrap().clone()
     } else {
         capture::spawn_source(settings)
     };
-    let persistent = persistent_source.lock().await.is_some();
     let (frames_tx, mut frames_rx) = mpsc::channel(1);
     let (audio_tx, mut audio_rx) = mpsc::channel(8);
     let audio = crate::audio::spawn(source.subscribe_audio(), audio_tx);
@@ -351,6 +358,12 @@ async fn run_session(
             error = source_errors.recv() => {
                 if let Ok(error) = error {
                     tracing::warn!(%error, "closing peer after capture failure");
+                }
+                if persistent_sessions {
+                    let mut cached = persistent_source.lock().await;
+                    if cached.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &source)) {
+                        cached.take();
+                    }
                 }
                 break;
             }
@@ -403,7 +416,7 @@ async fn run_session(
     let _ = tokio::task::spawn_blocking(move || {
         encoder.shutdown();
         audio.shutdown();
-        if !persistent {
+        if !persistent_sessions {
             if let Ok(source) = Arc::try_unwrap(source) {
                 source.shutdown();
             }

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use pinray::{AudioCapture, AudioFrame, CaptureEvent, CaptureSession, CursorMode, FrameData, SourceId, VideoCaptureTarget};
+use pinray::{AudioCapture, AudioFrame, CaptureEvent, CaptureSession, CursorMode, FrameData, PinrayError, SourceId, VideoCaptureTarget};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{
@@ -107,6 +107,10 @@ impl SourceSession {
 
     pub fn subscribe_errors(&self) -> broadcast::Receiver<String> {
         self.errors.subscribe()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.frames.0.lock().unwrap().closed
     }
 
     pub fn shutdown(mut self) {
@@ -218,9 +222,14 @@ fn capture_inner(
 
     let mut last_frame = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let event = capturer
-            .next_event(Some(CAPTURE_EVENT_TIMEOUT))
-            .map_err(|error| anyhow::anyhow!(error))?;
+        let event = match capturer.next_event(Some(CAPTURE_EVENT_TIMEOUT)) {
+            Ok(event) => event,
+            Err(PinrayError::Timeout(_)) if last_frame.elapsed() >= CAPTURE_TIMEOUT => {
+                bail!("screen capture produced no frames for two seconds");
+            }
+            Err(PinrayError::Timeout(_)) => continue,
+            Err(error) => return Err(anyhow::anyhow!(error)),
+        };
         match event {
             CaptureEvent::Video(frame) => {
                 let FrameData::Host(data) = frame.data else { continue };
@@ -239,9 +248,6 @@ fn capture_inner(
             }
             CaptureEvent::Audio(frame) => {
                 let _ = audio_sender.send(frame);
-            }
-            _ if last_frame.elapsed() >= CAPTURE_TIMEOUT => {
-                bail!("screen capture produced no frames for two seconds");
             }
             _ => {}
         }

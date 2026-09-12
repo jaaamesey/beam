@@ -232,11 +232,19 @@ fn move_mouse(enigo: &mut Enigo, x: f64, y: f64) {
         tracing::warn!("no display available for mouse input");
         return;
     };
-    let x = display.x + (x.clamp(0.0, 1.0) * (display.width.saturating_sub(1) as f64)) as i32;
-    let y = display.y + (y.clamp(0.0, 1.0) * (display.height.saturating_sub(1) as f64)) as i32;
+    let (x, y) = map_position(*display, x, y, cfg!(target_os = "linux"));
     if let Err(error) = enigo.move_mouse(x, y, Coordinate::Abs) {
         tracing::warn!(%error, "could not move native mouse");
     }
+}
+
+fn map_position(display: DisplayBounds, x: f64, y: f64, local_origin: bool) -> (i32, i32) {
+    let offset_x = if local_origin { 0 } else { display.x };
+    let offset_y = if local_origin { 0 } else { display.y };
+    (
+        offset_x + (x.clamp(0.0, 1.0) * display.width.saturating_sub(1) as f64) as i32,
+        offset_y + (y.clamp(0.0, 1.0) * display.height.saturating_sub(1) as f64) as i32,
+    )
 }
 
 fn scroll(enigo: &mut Enigo, delta_x: f64, delta_y: f64, delta_mode: u32) {
@@ -289,5 +297,13 @@ mod tests {
         );
 
         assert_eq!(output, vec![move_two, click, move_three]);
+    }
+
+    #[test]
+    fn linux_pointer_coordinates_are_local_to_the_capture_region() {
+        let display = DisplayBounds { x: 1920, y: 200, width: 1920, height: 1080 };
+        assert_eq!(map_position(display, 0.0, 0.0, true), (0, 0));
+        assert_eq!(map_position(display, 1.0, 1.0, true), (1919, 1079));
+        assert_eq!(map_position(display, 0.0, 0.0, false), (1920, 200));
     }
 }
