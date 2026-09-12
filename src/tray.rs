@@ -26,6 +26,7 @@ pub fn run(
     shutdown: Arc<AtomicBool>,
     input_rx: Receiver<Vec<u8>>,
 ) -> Result<()> {
+    #[allow(unused_mut)] // mutability is only exercised on macOS below
     let mut event_loop = EventLoop::new();
     #[cfg(target_os = "macos")]
     {
