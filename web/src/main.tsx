@@ -128,6 +128,31 @@ function Viewer() {
     }
   }, [])
 
+  /* Fix for dumbass Chrome MacOS bug where native green "Exit Fullscreen" button doesn't actually make the page exit fullscreen mode */
+  useEffect(() => {
+    let lastWidth = window.innerWidth
+    let lastHeight = window.innerHeight
+    let inFullscreen = !!document.fullscreenElement || document.fullscreen
+    let exitTimer: number | undefined
+    const fullscreenPoll = window.setInterval(() => {
+      const isFullscreen = !!document.fullscreenElement || document.fullscreen
+      if (inFullscreen && isFullscreen && (lastWidth !== window.innerWidth || lastHeight !== window.innerHeight)) {
+        exitTimer = window.setTimeout(() => {
+          void document.exitFullscreen()
+          void document.body.requestFullscreen()
+          void document.exitFullscreen()
+        }, 900)
+      }
+      lastWidth = window.innerWidth
+      lastHeight = window.innerHeight
+      inFullscreen = isFullscreen
+    }, 500)
+    return () => {
+      window.clearInterval(fullscreenPoll)
+      if (exitTimer !== undefined) window.clearTimeout(exitTimer)
+    }
+  }, [])
+
   function unlockKeyboard() {
     const keyboard = (navigator as Navigator & {
       keyboard?: { unlock?: () => void }

@@ -174,7 +174,7 @@ jobs:
           cp -R "$app" "$staging/Beam.app"
           ln -s /Applications "$staging/Applications"
           mkdir -p "$(dirname "$dmg")"
-          temporary_dmg="$dmg.tmp"
+          temporary_dmg="$dmg.tmp.dmg"
           rm -f "$temporary_dmg"
           hdiutil create -volname Beam -srcfolder "$staging" -ov -format UDZO "$temporary_dmg"
           mv -f "$temporary_dmg" "$dmg"
