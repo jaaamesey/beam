@@ -7,6 +7,7 @@ type Settings = { password: string; address: string }
 type Codec = 'h264' | 'h265' | 'av1'
 type HardwareCodecs = { h264: boolean; h265: boolean; av1: boolean }
 type StreamSettings = { codec: Codec; resolution: number; bitrate: number; host_cursor_visible: boolean }
+type LatencySample = { time: number; value: number }
 const ADMIN_TOKEN = 'beam_admin_token'
 const STREAM_SETTINGS = 'beam_stream_settings'
 
@@ -46,10 +47,6 @@ function Shell({ children }: { children: React.ReactNode }) {
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,#172235_0,#080b10_42%)] px-5 py-10">
       <div className="mx-auto max-w-5xl">
-        <header className="mb-10 flex items-center gap-3">
-          <div className="grid size-9 place-items-center rounded-xl bg-cyan-300 font-black text-slate-950">B</div>
-          <span className="text-lg font-semibold tracking-tight">Beam</span>
-        </header>
         {children}
       </div>
     </main>
@@ -69,9 +66,14 @@ function Viewer() {
   const rememberedSettings = useRef(loadStreamSettings())
   const hostSettings = useRef<StreamSettings | null>(null)
   const latencySamples = useRef<Array<{ time: number; value: number }>>([])
+  const encodeLatencySamples = useRef<LatencySample[]>([])
+  const networkLatencySamples = useRef<LatencySample[]>([])
+  const encodeLatencyRef = useRef(0)
   const [password, setPassword] = useState('')
   const [status, setStatus] = useState('Ready')
   const [latency, setLatency] = useState<number | null>(null)
+  const [encodeLatency, setEncodeLatency] = useState(0)
+  const [networkLatency, setNetworkLatency] = useState(0)
   const [fullscreen, setFullscreen] = useState(false)
   const [streamAspect, setStreamAspect] = useState(16 / 9)
   const [clientMouseVisible, setClientMouseVisible] = useState(true)
@@ -169,7 +171,12 @@ function Viewer() {
     if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
     latencyFrameCallback.current = undefined
     latencySamples.current = []
+    encodeLatencySamples.current = []
+    networkLatencySamples.current = []
+    encodeLatencyRef.current = 0
     setLatency(null)
+    setEncodeLatency(0)
+    setNetworkLatency(0)
     setStatus('Authenticating…')
     try {
       await json('/api/session', { method: 'POST', body: JSON.stringify({ password }) })
@@ -184,10 +191,16 @@ function Viewer() {
       input.onmessage = event => {
         if (generation !== connectionGeneration.current) return
         try {
-          const message = JSON.parse(event.data) as {
-            type?: string; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs
-          }
-          if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
+            const message = JSON.parse(event.data) as {
+              type?: string; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs; encode_ms?: number
+            }
+            if (message.type === 'streamStats' && message.encode_ms != null) {
+              const average = recordLatencySample(encodeLatencySamples, message.encode_ms)
+              encodeLatencyRef.current = average
+              setEncodeLatency(average)
+              return
+            }
+           if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
           const changed = settingsReady.current && hostSettings.current != null && (
             hostSettings.current.codec !== message.codec ||
             hostSettings.current.resolution !== message.resolution ||
@@ -268,17 +281,15 @@ function Viewer() {
           video.current.srcObject = stream
           const currentVideo = video.current
           const recordLatency = (value: number) => {
-            const time = performance.now()
-            const samples = latencySamples.current
-            samples.push({ time, value: Math.max(0, value) })
-            const recent = samples.filter(sample => sample.time >= time - 1000)
-            latencySamples.current = recent
-            setLatency(Math.max(1, Math.round(recent.reduce((sum, sample) => sum + sample.value, 0) / recent.length)))
+            setLatency(recordLatencySample(latencySamples, value))
           }
           const updateLatency = (_now: number, metadata: VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number }) => {
             if (generation !== connectionGeneration.current) return
-            void measureFrameAge(pc, performance.now(), metadata).then(value => {
-              if (generation === connectionGeneration.current && value != null) recordLatency(value)
+            void measureFrameTimings(pc, performance.now(), metadata, encodeLatencyRef.current).then(timings => {
+              if (generation !== connectionGeneration.current) return
+              if (timings.age != null) recordLatency(timings.age)
+              if (timings.network != null)
+                setNetworkLatency(recordLatencySample(networkLatencySamples, timings.network))
             })
             latencyFrameCallback.current = currentVideo.requestVideoFrameCallback(updateLatency)
           }
@@ -315,7 +326,12 @@ function Viewer() {
           if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
           latencyFrameCallback.current = undefined
           latencySamples.current = []
+          encodeLatencySamples.current = []
+          networkLatencySamples.current = []
+          encodeLatencyRef.current = 0
           setLatency(null)
+          setEncodeLatency(0)
+          setNetworkLatency(0)
         }
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && video.current)
           video.current.srcObject = null
@@ -429,7 +445,9 @@ function Viewer() {
       </form>
       <p className="mt-3 text-sm text-slate-400">
         {status}
-        {status === 'connected' && latency != null && <span className="ml-2 text-slate-500">· {latency} ms</span>}
+        {status === 'connected' && latency != null && <span className="ml-2 text-slate-500">
+          · {latency} ms ({encodeLatency} ms encode, {networkLatency} ms network [PROBABLY INACCURATE])
+        </span>}
       </p>
     </Shell>
   )
@@ -586,13 +604,28 @@ function waitForIce(pc: RTCPeerConnection) {
   })
 }
 
-async function measureFrameAge(
+function recordLatencySample(samples: { current: LatencySample[] }, value: number) {
+  const time = performance.now()
+  const recent = [...samples.current, { time, value: Math.max(0, value) }]
+    .filter(sample => sample.time >= time - 1000)
+  samples.current = recent
+  return Math.max(1, Math.round(recent.reduce((sum, sample) => sum + sample.value, 0) / recent.length))
+}
+
+async function measureFrameTimings(
   pc: RTCPeerConnection,
   now: number,
   metadata: VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number },
+  encodeMs: number,
 ) {
-  const frameTime = metadata.captureTime ?? metadata.receiveTime
-  if (frameTime != null) return now - frameTime
+  const age = metadata.captureTime != null
+    ? now - metadata.captureTime
+    : metadata.receiveTime != null ? now - metadata.receiveTime : null
+  const network = metadata.captureTime != null && metadata.receiveTime != null
+    ? Math.max(0, metadata.receiveTime - metadata.captureTime - encodeMs)
+    : null
+  if (age != null || network != null)
+    return { age, network: network ?? Math.max(1, (age ?? 0) - encodeMs) }
 
   const stats = await pc.getStats()
   let jitterBufferDelay: number | undefined
@@ -600,7 +633,11 @@ async function measureFrameAge(
     if (report.type === 'inbound-rtp' && report.kind === 'video' && report.jitterBufferDelay != null && report.jitterBufferEmittedCount)
       jitterBufferDelay = report.jitterBufferDelay / report.jitterBufferEmittedCount
   })
-  return jitterBufferDelay == null ? null : jitterBufferDelay * 1000
+  const measuredAge = jitterBufferDelay == null ? null : jitterBufferDelay * 1000
+  return {
+    age: measuredAge,
+    network: measuredAge == null ? null : Math.max(1, measuredAge - encodeMs),
+  }
 }
 
 function streamPosition(video: HTMLVideoElement, clientX: number, clientY: number) {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use webrtc::{
@@ -28,6 +28,7 @@ pub struct Media {
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
     hardware_codecs: capture::HardwareCodecAvailability,
+    encode_duration_us: Arc<AtomicU64>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +51,12 @@ struct StreamSettingsMessage {
     bitrate: u32,
     host_cursor_visible: bool,
     hardware_codecs: capture::HardwareCodecAvailability,
+}
+
+#[derive(Serialize)]
+struct StreamStatsMessage {
+    r#type: &'static str,
+    encode_ms: f64,
 }
 
 impl Media {
@@ -97,6 +104,7 @@ impl Media {
             input_tx,
             settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
             hardware_codecs: capture::ffmpeg::hardware_codecs(),
+            encode_duration_us: Arc::new(AtomicU64::new(0)),
         });
         Ok(media)
     }
@@ -121,9 +129,12 @@ impl Media {
         let input_tx = self.input_tx.clone();
         let settings = self.settings.clone();
         let hardware_codecs = self.hardware_codecs;
+        // NOTE: This measurement is fucking wrong and absolutely fucking braindead. This needs to be rethought.
+        let encode_duration_us = self.encode_duration_us.clone();
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_tx = input_tx.clone();
             let settings = settings.clone();
+            let encode_duration_us = encode_duration_us.clone();
             Box::pin(async move {
                 if channel.label() != "input" {
                     return;
@@ -134,6 +145,7 @@ impl Media {
                 channel.on_open(Box::new(move || {
                     let channel = open_channel.clone();
                     let settings = open_settings.clone();
+                    let encode_duration_us = encode_duration_us.clone();
                     Box::pin(async move {
                         let settings = *settings.read().await;
                         let message = serde_json::to_string(&StreamSettingsMessage {
@@ -145,6 +157,21 @@ impl Media {
                             hardware_codecs,
                         }).unwrap();
                         let _ = channel.send_text(message).await;
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+                                    break;
+                                }
+                                let stats = serde_json::to_string(&StreamStatsMessage {
+                                    r#type: "streamStats",
+                                    encode_ms: encode_duration_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                                }).unwrap();
+                                if channel.send_text(stats).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
                     })
                 }));
                 let message_channel = channel.clone();
@@ -223,7 +250,13 @@ impl Media {
             .local_description()
             .await
             .context("missing local description")?;
-        tokio::spawn(run_session(peer, track, audio_track, settings_snapshot));
+        tokio::spawn(run_session(
+            peer,
+            track,
+            audio_track,
+            settings_snapshot,
+            self.encode_duration_us.clone(),
+        ));
         Ok(answer)
     }
 }
@@ -233,6 +266,7 @@ async fn run_session(
     track: Arc<TrackLocalStaticSample>,
     audio_track: Arc<TrackLocalStaticSample>,
     settings: crate::capture::StreamSettings,
+    encode_duration_us: Arc<AtomicU64>,
 ) {
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
         while matches!(
@@ -264,6 +298,10 @@ async fn run_session(
             }
             frame = frames_rx.recv() => {
                 let Some(frame) = frame else { break };
+                // Zero means "warmup batch, excluded from telemetry"; skip it.
+                if !frame.encode_duration.is_zero() {
+                    encode_duration_us.store(frame.encode_duration.as_micros() as u64, Ordering::Relaxed);
+                }
                 if let Err(error) = track.write_sample(&Sample {
                     data: frame.data.into(),
                     duration: frame.duration,

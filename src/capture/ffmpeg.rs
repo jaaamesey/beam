@@ -1,10 +1,17 @@
 use anyhow::{Context as _, Result, bail};
 use ffmpeg_next as ffmpeg;
-use ffmpeg::{Dictionary, Rational, codec, encoder, format, frame};
-use std::{sync::{Arc, OnceLock}, time::Duration};
+use ffmpeg::{
+    Dictionary, Rational, codec, encoder, format, frame,
+    software::scaling::{context::Context as ScalingContext, flag::Flags},
+};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 
-use super::{Codec, EncodedFrame, LatestFrame, RawFrame, FPS, next_frame, scale_bgra_to_i420};
+use super::{Codec, EncodedFrame, LatestFrame, RawFrame, FPS, next_frame};
 
 static FFMPEG_INIT: OnceLock<bool> = OnceLock::new();
 
@@ -28,30 +35,108 @@ pub(super) fn encode(
 ) -> Result<()> {
     initialize().context("initialize FFmpeg")?;
 
-    let mut encoder = Encoder::open(codec, width, height, bitrate)
-        .context("open FFmpeg video encoder")?;
+    let mut encoder =
+        Encoder::open(codec, width, height, bitrate).context("open FFmpeg video encoder")?;
     tracing::info!(codec = ?codec, encoder = encoder.name, hardware = encoder.hardware, "using FFmpeg video encoder");
 
+    let (scaled_width, scaled_height) = scaled_dimensions(first.width, first.height, width, height);
+    let mut scaler = ScalingContext::get(
+        format::Pixel::BGRA,
+        first.width as u32,
+        first.height as u32,
+        format::Pixel::YUV420P,
+        scaled_width as u32,
+        scaled_height as u32,
+        Flags::FAST_BILINEAR,
+    )
+    .context("create FFmpeg video scaler")?;
     let mut previous_time = None;
+    let mut submissions: VecDeque<(i64, Instant)> = VecDeque::new();
+    let mut next_pts = 0i64;
+    // Encoder initialization (codec open, thread pool start) shows up as
+    // inflated latency on the first drained batch. Consume the packets but
+    // exclude them from telemetry so codec switches don't poison averages.
+    let mut primed = false;
     let mut source = Some(first);
     loop {
-        let Some(source) = source.take().or_else(|| next_frame(&frames)) else { return Ok(()) };
-        let video = yuv_frame(&source, width, height)?;
-        encoder.context.send_frame(&video).context("queue FFmpeg video frame")?;
+        let Some(source) = source.take().or_else(|| next_frame(&frames)) else {
+            return Ok(());
+        };
+        let mut video = yuv_frame(
+            &source,
+            width,
+            height,
+            scaled_width,
+            scaled_height,
+            &mut scaler,
+        )?;
+        video.set_pts(Some(next_pts));
+        submissions.push_back((next_pts, Instant::now()));
+        if submissions.len() > 256 {
+            submissions.pop_front();
+        }
+        next_pts += 1;
+        encoder
+            .context
+            .send_frame(&video)
+            .context("queue FFmpeg video frame")?;
         let duration = previous_time
             .and_then(|time| source.captured_at.duration_since(time).ok())
             .unwrap_or(Duration::from_secs_f64(1.0 / FPS as f64))
             .clamp(Duration::from_millis(1), Duration::from_secs(1));
         previous_time = Some(source.captured_at);
 
+        let mut packets = Vec::new();
         let mut packet = ffmpeg::Packet::empty();
         while encoder.context.receive_packet(&mut packet).is_ok() {
-            let Some(data) = packet.data() else { continue };
-            if sender.blocking_send(EncodedFrame { data: data.to_vec(), duration }).is_err() {
-                return Ok(());
+            if let Some(data) = packet.data() {
+                packets.push((packet.pts(), data.to_vec()));
             }
             packet = ffmpeg::Packet::empty();
         }
+        let drained_at = Instant::now();
+        let had_packets = !packets.is_empty();
+        for (pts, data) in packets {
+            // Match by pts; threaded encoders finish packets asynchronously,
+            // so per-frame latency must be anchored to submission time, not
+            // measured across the submit/drain calls of a single iteration.
+            let index = pts.and_then(|pts| submissions.iter().position(|&(p, _)| p == pts));
+            let entry = match index {
+                Some(index) => submissions.remove(index),
+                None => submissions.pop_front(),
+            };
+            let encode_duration = if !primed {
+                Duration::ZERO
+            } else {
+                entry
+                    .map(|(_, submitted_at)| drained_at.duration_since(submitted_at))
+                    .unwrap_or(Duration::ZERO)
+            };
+            if sender
+                .blocking_send(EncodedFrame {
+                    data,
+                    duration,
+                    encode_duration,
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        primed |= had_packets;
+    }
+}
+
+fn scaled_dimensions(
+    source_width: usize,
+    source_height: usize,
+    width: usize,
+    height: usize,
+) -> (usize, usize) {
+    if width * source_height <= height * source_width {
+        (width, (source_height * width / source_width).max(2) & !1)
+    } else {
+        ((source_width * height / source_height).max(2) & !1, height)
     }
 }
 
@@ -169,22 +254,90 @@ fn hardware_names(codec: &str) -> &'static [&'static str] {
     &[]
 }
 
-fn yuv_frame(source: &RawFrame, width: usize, height: usize) -> Result<frame::Video> {
-    let (y, u, v) = scale_bgra_to_i420(&source.bgra, source.width, source.height, source.stride, width, height)?;
-    let mut frame = frame::Video::new(format::Pixel::YUV420P, width as u32, height as u32);
-    copy_plane(&mut frame, 0, &y, width, height);
-    copy_plane(&mut frame, 1, &u, width / 2, height / 2);
-    copy_plane(&mut frame, 2, &v, width / 2, height / 2);
-    Ok(frame)
+fn yuv_frame(
+    source: &RawFrame,
+    width: usize,
+    height: usize,
+    scaled_width: usize,
+    scaled_height: usize,
+    scaler: &mut ScalingContext,
+) -> Result<frame::Video> {
+    let mut input =
+        frame::Video::new(format::Pixel::BGRA, source.width as u32, source.height as u32);
+    let input_stride = input.stride(0);
+    let row_bytes = source.width * 4;
+    for row in 0..source.height {
+        let source_start = row * source.stride;
+        let target_start = row * input_stride;
+        input.data_mut(0)[target_start..target_start + row_bytes]
+            .copy_from_slice(&source.bgra[source_start..source_start + row_bytes]);
+    }
+
+    let mut scaled = frame::Video::new(
+        format::Pixel::YUV420P,
+        scaled_width as u32,
+        scaled_height as u32,
+    );
+    scaler
+        .run(&input, &mut scaled)
+        .context("convert captured frame")?;
+    if scaled_width == width && scaled_height == height {
+        return Ok(scaled);
+    }
+
+    let mut output = frame::Video::new(format::Pixel::YUV420P, width as u32, height as u32);
+    output.data_mut(0).fill(16);
+    output.data_mut(1).fill(128);
+    output.data_mut(2).fill(128);
+    let left = (width - scaled_width) / 2;
+    let top = (height - scaled_height) / 2;
+    copy_plane(
+        &mut output,
+        &scaled,
+        0,
+        left,
+        top,
+        scaled_width,
+        scaled_height,
+    );
+    copy_plane(
+        &mut output,
+        &scaled,
+        1,
+        left / 2,
+        top / 2,
+        scaled_width / 2,
+        scaled_height / 2,
+    );
+    copy_plane(
+        &mut output,
+        &scaled,
+        2,
+        left / 2,
+        top / 2,
+        scaled_width / 2,
+        scaled_height / 2,
+    );
+    Ok(output)
 }
 
-fn copy_plane(frame: &mut frame::Video, plane: usize, source: &[u8], width: usize, height: usize) {
-    let stride = frame.stride(plane);
-    let target = frame.data_mut(plane);
+fn copy_plane(
+    target: &mut frame::Video,
+    source: &frame::Video,
+    plane: usize,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+) {
+    let source_stride = source.stride(plane);
+    let target_stride = target.stride(plane);
+    let source_data = source.data(plane);
+    let target_data = target.data_mut(plane);
     for row in 0..height {
-        let source_start = row * width;
-        let target_start = row * stride;
-        target[target_start..target_start + width]
-            .copy_from_slice(&source[source_start..source_start + width]);
+        let source_start = row * source_stride;
+        let target_start = (top + row) * target_stride + left;
+        target_data[target_start..target_start + width]
+            .copy_from_slice(&source_data[source_start..source_start + width]);
     }
 }
