@@ -105,10 +105,17 @@ struct Password {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    password: String,
+    persistent_sessions: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct Settings {
     password: String,
     address: String,
+    persistent_sessions: bool,
 }
 
 #[derive(Serialize)]
@@ -130,13 +137,11 @@ fn main() -> Result<()> {
         .with_writer(logs.clone())
         .init();
 
-    input::check_permissions();
-    capture::check_permissions();
-
     let runtime = tokio::runtime::Runtime::new()?;
     let listener = runtime.block_on(TcpListener::bind(("0.0.0.0", PORT)))?;
     let bound_address = listener.local_addr()?;
     let config = Config::load()?;
+    let persistent_sessions = config.persistent_sessions;
     let network_address = format!("http://{}:{PORT}", local_ip());
     let open_settings = !Config::settings_opened()?;
     let settings_url = format!("https://127.0.0.1:{PORT}/settings#{}", config.admin_token);
@@ -146,7 +151,7 @@ fn main() -> Result<()> {
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
-        media: rtc::Media::new(input_tx)?,
+        media: rtc::Media::new(input_tx, persistent_sessions)?,
         shutdown: shutdown_flag.clone(),
         network_address,
         logs,
@@ -186,7 +191,9 @@ fn main() -> Result<()> {
     if open_settings && let Err(error) = open::that(&first_settings_url) {
         tracing::warn!(%error, "could not open settings in the browser");
     }
-    tray::run(settings_url, shutdown_flag, input_rx)
+    let result = tray::run(settings_url, shutdown_flag, input_rx, persistent_sessions);
+    runtime.block_on(app.media.shutdown());
+    result
 }
 
 fn resource_path(relative: &str) -> PathBuf {
@@ -334,6 +341,7 @@ async fn get_settings(
     Ok(Json(Settings {
         password: app.config.read().await.password.clone(),
         address: app.network_address.clone(),
+        persistent_sessions: app.config.read().await.persistent_sessions,
     }))
 }
 
@@ -353,7 +361,7 @@ async fn put_settings(
     State(app): State<Arc<App>>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(input): Json<Password>,
+    Json(input): Json<SettingsUpdate>,
 ) -> HttpResult<Json<serde_json::Value>> {
     require_admin(&app, address, &headers).await?;
     if input.password.len() < 4 {
@@ -362,9 +370,11 @@ async fn put_settings(
             "Password must be at least 4 characters".into(),
         ));
     }
+    let current = app.config.read().await.clone();
     let config = Config {
         password: input.password,
-        admin_token: app.config.read().await.admin_token.clone(),
+        admin_token: current.admin_token,
+        persistent_sessions: input.persistent_sessions.unwrap_or(current.persistent_sessions),
     };
     config.save().map_err(internal)?;
     *app.config.write().await = config;

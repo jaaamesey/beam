@@ -1,31 +1,25 @@
 use display_info::DisplayInfo;
 use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::OnceLock};
 
 thread_local! {
     static SCROLL_REMAINDER: RefCell<(f64, f64)> = const { RefCell::new((0.0, 0.0)) };
 }
 
-pub fn check_permissions() {
-    #[cfg(target_os = "macos")]
-    if !macos_accessibility_client::accessibility::application_is_trusted_with_prompt() {
-        tracing::warn!(
-            "Beam is not trusted for Accessibility; enable it in System Settings > Privacy & Security > Accessibility"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        tracing::info!(
-            "Wayland detected; Beam will use the compositor/libei input backend if supported"
-        );
-    }
+#[derive(Clone, Copy)]
+struct DisplayBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
+
+static PRIMARY_DISPLAY: OnceLock<Option<DisplayBounds>> = OnceLock::new();
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum Message {
+pub(crate) enum Message {
     #[serde(rename = "mouseMove")]
     MouseMove { x: f64, y: f64 },
     #[serde(rename = "wheel")]
@@ -43,6 +37,10 @@ enum Message {
     KeyUp { code: String, key: String },
     #[serde(rename = "mouseButton")]
     MouseButton { button: u16, down: bool },
+}
+
+pub fn is_mouse_move(message: &[u8]) -> bool {
+    matches!(serde_json::from_slice::<Message>(message), Ok(Message::MouseMove { .. }))
 }
 
 pub fn new() -> anyhow::Result<Enigo> {
@@ -142,14 +140,22 @@ fn move_mouse(enigo: &mut Enigo, x: f64, y: f64) {
     if !x.is_finite() || !y.is_finite() {
         return;
     }
-    let displays = match DisplayInfo::all() {
-        Ok(displays) => displays,
-        Err(error) => {
-            tracing::warn!(%error, "could not enumerate displays for mouse input");
-            return;
-        }
-    };
-    let Some(display) = displays.iter().find(|display| display.is_primary).or(displays.first()) else {
+    let Some(display) = PRIMARY_DISPLAY.get_or_init(|| {
+        let displays = match DisplayInfo::all() {
+            Ok(displays) => displays,
+            Err(error) => {
+                tracing::warn!(%error, "could not enumerate displays for mouse input");
+                return None;
+            }
+        };
+        let display = displays.iter().find(|display| display.is_primary).or(displays.first())?;
+        Some(DisplayBounds {
+            x: display.x,
+            y: display.y,
+            width: display.width,
+            height: display.height,
+        })
+    }) else {
         tracing::warn!("no display available for mouse input");
         return;
     };

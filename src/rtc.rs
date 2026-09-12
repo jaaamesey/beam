@@ -28,6 +28,7 @@ pub struct Media {
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
     active_session: Arc<tokio::sync::Mutex<Option<ActiveSession>>>,
+    persistent_source: Arc<tokio::sync::Mutex<Option<Arc<capture::SourceSession>>>>,
     hardware_codecs: capture::HardwareCodecAvailability,
     encode_duration_us: Arc<AtomicU64>,
 }
@@ -66,7 +67,7 @@ struct StreamStatsMessage {
 }
 
 impl Media {
-    pub fn new(input_tx: std::sync::mpsc::Sender<Vec<u8>>) -> Result<Arc<Self>> {
+    pub fn new(input_tx: std::sync::mpsc::Sender<Vec<u8>>, persistent_sessions: bool) -> Result<Arc<Self>> {
         let mut engine = MediaEngine::default();
         let h264 = RTCRtpCodecCapability {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -110,6 +111,9 @@ impl Media {
             input_tx,
             settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
             active_session: Arc::new(tokio::sync::Mutex::new(None)),
+            persistent_source: Arc::new(tokio::sync::Mutex::new(
+                persistent_sessions.then(|| capture::spawn_source(Default::default())),
+            )),
             hardware_codecs: capture::ffmpeg::hardware_codecs(),
             encode_duration_us: Arc::new(AtomicU64::new(0)),
         });
@@ -273,8 +277,19 @@ impl Media {
             settings_snapshot,
             self.encode_duration_us.clone(),
             shutdown_rx,
+            self.persistent_source.clone(),
         ));
         Ok(answer)
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(active) = self.active_session.lock().await.take() {
+            let _ = active.shutdown.send(());
+            let _ = active.peer.close().await;
+        }
+        if let Some(source) = self.persistent_source.lock().await.take() {
+            source.stop();
+        }
     }
 }
 
@@ -285,6 +300,7 @@ async fn run_session(
     settings: crate::capture::StreamSettings,
     encode_duration_us: Arc<AtomicU64>,
     mut shutdown: oneshot::Receiver<()>,
+    persistent_source: Arc<tokio::sync::Mutex<Option<Arc<capture::SourceSession>>>>,
 ) {
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -309,16 +325,29 @@ async fn run_session(
         return;
     }
 
+    let source = if let Some(source) = persistent_source.lock().await.clone() {
+        source
+    } else {
+        capture::spawn_source(settings)
+    };
+    let persistent = persistent_source.lock().await.is_some();
     let (frames_tx, mut frames_rx) = mpsc::channel(1);
     let (audio_tx, mut audio_rx) = mpsc::channel(8);
-    let (audio, audio_frames_tx) = crate::audio::spawn(audio_tx);
-    let (capture, mut capture_errors) = capture::spawn(frames_tx, audio_frames_tx, settings);
+    let audio = crate::audio::spawn(source.subscribe_audio(), audio_tx);
+    let (encoder, mut encoder_errors) = capture::spawn_encoder(&source, frames_tx, settings);
+    let mut source_errors = source.subscribe_errors();
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
-            error = capture_errors.recv() => {
-                if let Some(error) = error {
+            error = source_errors.recv() => {
+                if let Ok(error) = error {
                     tracing::warn!(%error, "closing peer after capture failure");
+                }
+                break;
+            }
+            error = encoder_errors.recv() => {
+                if let Some(error) = error {
+                    tracing::warn!(%error, "closing peer after encoder failure");
                 }
                 break;
             }
@@ -363,10 +392,13 @@ async fn run_session(
         }
     }
     let _ = tokio::task::spawn_blocking(move || {
-        // Stop capture first so its audio sender is dropped; that wakes the
-        // audio worker's blocking receive before it is joined.
-        capture.shutdown();
+        encoder.shutdown();
         audio.shutdown();
+        if !persistent {
+            if let Ok(source) = Arc::try_unwrap(source) {
+                source.shutdown();
+            }
+        }
     })
     .await;
     let _ = peer.close().await;

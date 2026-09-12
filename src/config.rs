@@ -8,6 +8,8 @@ use std::{fs, path::PathBuf};
 pub struct Config {
     pub password: String,
     pub admin_token: String,
+    #[serde(default = "default_persistent_sessions")]
+    pub persistent_sessions: bool,
 }
 
 impl Config {
@@ -23,6 +25,7 @@ impl Config {
                 .map(char::from)
                 .collect(),
             admin_token: admin_token(),
+            persistent_sessions: default_persistent_sessions(),
         };
         config.save()?;
         Ok(config)
@@ -52,6 +55,10 @@ impl Config {
         fs::write(marker, b"opened")?;
         Ok(())
     }
+}
+
+fn default_persistent_sessions() -> bool {
+    cfg!(target_os = "linux")
 }
 
 fn admin_token() -> String {

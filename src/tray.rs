@@ -25,6 +25,7 @@ pub fn run(
     settings_url: String,
     shutdown: Arc<AtomicBool>,
     input_rx: Receiver<Vec<u8>>,
+    persistent_sessions: bool,
 ) -> Result<()> {
     #[allow(unused_mut)] // mutability is only exercised on macOS below
     let mut event_loop = EventLoop::new();
@@ -51,11 +52,33 @@ pub fn run(
 
     let icon = icon()?;
     let mut tray = None;
-    let mut enigo = crate::input::new()?;
+    let mut enigo = if persistent_sessions {
+        Some(crate::input::new()?)
+    } else {
+        None
+    };
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2));
+        let mut latest_mouse_move = None;
         for message in input_rx.try_iter() {
-            crate::input::handle(&mut enigo, &message);
+            if crate::input::is_mouse_move(&message) {
+                latest_mouse_move = Some(message);
+            } else {
+                if enigo.is_none() {
+                    enigo = crate::input::new().ok();
+                }
+                if let Some(enigo) = enigo.as_mut() {
+                    crate::input::handle(enigo, &message);
+                }
+            }
+        }
+        if let Some(message) = latest_mouse_move {
+            if enigo.is_none() {
+                enigo = crate::input::new().ok();
+            }
+            if let Some(enigo) = enigo.as_mut() {
+                crate::input::handle(enigo, &message);
+            }
         }
         if shutdown.load(Ordering::Relaxed) {
             *control_flow = ControlFlow::Exit;

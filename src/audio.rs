@@ -3,7 +3,7 @@ use opus::{Application, Channels, Encoder};
 use pinray::{AudioData, AudioFrame, SampleFormat};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 const OPUS_FRAME_SAMPLES: usize = 240 * 2;
 const OPUS_FRAME_DURATION: Duration = Duration::from_millis(5);
@@ -28,19 +28,21 @@ impl Session {
     }
 }
 
-pub fn spawn(sender: mpsc::Sender<(Vec<u8>, Duration)>) -> (Session, mpsc::Sender<AudioFrame>) {
+pub fn spawn(
+    mut frames: broadcast::Receiver<AudioFrame>,
+    sender: mpsc::Sender<(Vec<u8>, Duration)>,
+) -> Session {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
-    let (frames_sender, frames_receiver) = mpsc::channel(8);
     let thread = std::thread::Builder::new()
         .name("beam-audio".into())
-        .spawn(move || encode_audio(frames_receiver, thread_stop, sender))
+        .spawn(move || encode_audio(&mut frames, thread_stop, sender))
         .expect("audio encoder thread");
-    (Session { stop, thread: Some(thread) }, frames_sender)
+    Session { stop, thread: Some(thread) }
 }
 
 fn encode_audio(
-    mut frames: mpsc::Receiver<AudioFrame>,
+    frames: &mut broadcast::Receiver<AudioFrame>,
     stop: Arc<AtomicBool>,
     sender: mpsc::Sender<(Vec<u8>, Duration)>,
 ) {
@@ -54,7 +56,13 @@ fn encode_audio(
     let mut pcm = Vec::new();
     let mut previous_time = None;
     while !stop.load(Ordering::Relaxed) {
-        let Some(frame) = frames.blocking_recv() else { break };
+        let frame = loop {
+            match frames.blocking_recv() {
+                Ok(frame) => break frame,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        };
         let mut samples = Vec::new();
         if let Err(error) = append_stereo(&mut samples, &frame.data, frame.sample_format, frame.channels) {
             tracing::warn!(%error, "unsupported system audio format");

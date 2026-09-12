@@ -6,7 +6,7 @@ use ffmpeg::{
 };
 use std::{
     collections::VecDeque,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -54,6 +54,7 @@ pub(crate) fn hardware_codecs() -> super::HardwareCodecAvailability {
 pub(super) fn encode(
     codec: Codec,
     frames: LatestFrame,
+    stop: Arc<AtomicBool>,
     sender: mpsc::Sender<EncodedFrame>,
     first: Arc<RawFrame>,
     width: usize,
@@ -86,8 +87,8 @@ pub(super) fn encode(
     // is ready. Waiting for one packet before feeding the next can deadlock
     // encoders that need multiple input frames before producing output.
     let mut primed = false;
-    loop {
-        let Some(source) = source.take().or_else(|| next_frame(&frames)) else {
+    while !stop.load(Ordering::Relaxed) {
+        let Some(source) = source.take().or_else(|| next_frame(&frames, &stop)) else {
             return Ok(());
         };
         let conversion_start = Instant::now();
@@ -123,6 +124,7 @@ pub(super) fn encode(
             timings.report();
         }
     }
+    Ok(())
 }
 
 fn drain_packets(

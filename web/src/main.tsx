@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import './index.css'
 
-type Settings = { password: string; address: string }
+type Settings = { password: string; address: string; persistent_sessions: boolean }
 type Codec = 'h264' | 'h265' | 'av1'
 type HardwareCodecs = { h264: boolean; h265: boolean; av1: boolean }
 type StreamSettings = { codec: Codec; resolution: number; bitrate: number; host_cursor_visible: boolean }
@@ -458,6 +458,7 @@ function SettingsPage() {
   const [authorized, setAuthorized] = useState<boolean | null>(null)
   const [password, setPassword] = useState('')
   const [address, setAddress] = useState('')
+  const [persistentSessions, setPersistentSessions] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [status, setStatus] = useState('Loading…')
@@ -474,6 +475,7 @@ function SettingsPage() {
         localStorage.setItem(ADMIN_TOKEN, token)
         setPassword(value.password)
         setAddress(value.address)
+        setPersistentSessions(value.persistent_sessions)
         setStatus('Saved.')
         setAuthorized(true)
         return json('/api/admin/settings-opened', {
@@ -515,7 +517,7 @@ function SettingsPage() {
       await json('/api/admin/settings', {
         method: 'PUT',
         headers: { authorization: `Bearer ${token}` },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ password, persistent_sessions: persistentSessions }),
       })
       setStatus('Saved')
     } catch (error) {
@@ -576,6 +578,17 @@ function SettingsPage() {
             <span className="text-sm text-slate-400">{status}</span>
           </div>
         </form>
+        <section className="mt-8 border-t border-white/10 pt-6">
+          <h2 className="text-xl font-semibold tracking-tight">Permissions</h2>
+          <label className="mt-4 flex items-start gap-3 text-sm text-slate-300">
+            <input type="checkbox" checked={persistentSessions}
+              onChange={event => setPersistentSessions(event.target.checked)} className="mt-1 size-4" />
+            <span>
+              <span className="block font-medium text-white">Keep capture and input sessions persistent</span>
+              <span className="mt-1 block text-slate-400">Request capture and input permissions at startup and reuse the sessions across reconnects. Recommended on Linux which is more aggressive about asking for those permissions. May use more energy.</span>
+            </span>
+          </label>
+        </section>
         <section className="mt-8 border-t border-white/10 pt-6">
           <h2 className="text-xl font-semibold tracking-tight">Application log</h2>
           <pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-black/40 p-4 font-mono text-xs leading-5 text-slate-300">{logs || 'No log output yet.'}</pre>

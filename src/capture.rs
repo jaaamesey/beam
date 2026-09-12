@@ -8,17 +8,9 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 pub(crate) mod ffmpeg;
-
-pub fn check_permissions() {
-    #[cfg(target_os = "macos")]
-    match pinray::enumerate_sources() {
-        Ok(_) => tracing::info!("screen recording permission is available"),
-        Err(error) => tracing::warn!(%error, "screen recording permission is unavailable"),
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +30,7 @@ pub struct HardwareCodecAvailability {
 pub const CODEC: Codec = Codec::H264;
 pub const FPS: u32 = 60;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+const CAPTURE_EVENT_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct StreamSettings {
@@ -72,49 +65,59 @@ pub(crate) struct RawFrame {
     pub(crate) captured_at: SystemTime,
 }
 
-struct FrameSlot {
+pub(crate) struct FrameSlot {
     frame: Option<Arc<RawFrame>>,
     closed: bool,
 }
 
-type LatestFrame = Arc<(Mutex<FrameSlot>, Condvar)>;
+pub(crate) type LatestFrame = Arc<(Mutex<FrameSlot>, Condvar)>;
 
-pub struct Session {
+pub struct SourceSession {
     stop: Arc<AtomicBool>,
     frames: LatestFrame,
-    capture_thread: Option<std::thread::JoinHandle<()>>,
-    encoder_thread: Option<std::thread::JoinHandle<()>>,
+    audio: broadcast::Sender<AudioFrame>,
+    errors: broadcast::Sender<String>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for Session {
+impl Drop for SourceSession {
     fn drop(&mut self) {
         self.request_stop();
     }
 }
 
-impl Session {
+impl SourceSession {
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.frames.0.lock().unwrap().closed = true;
         self.frames.1.notify_all();
     }
 
+    pub fn stop(&self) {
+        self.request_stop();
+    }
+
+    pub(crate) fn frames(&self) -> LatestFrame {
+        self.frames.clone()
+    }
+
+    pub fn subscribe_audio(&self) -> broadcast::Receiver<AudioFrame> {
+        self.audio.subscribe()
+    }
+
+    pub fn subscribe_errors(&self) -> broadcast::Receiver<String> {
+        self.errors.subscribe()
+    }
+
     pub fn shutdown(mut self) {
         self.request_stop();
-        if let Some(thread) = self.capture_thread.take() {
-            let _ = thread.join();
-        }
-        if let Some(thread) = self.encoder_thread.take() {
+        if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-pub fn spawn(
-    sender: mpsc::Sender<EncodedFrame>,
-    audio_sender: mpsc::Sender<AudioFrame>,
-    settings: StreamSettings,
-) -> (Session, mpsc::Receiver<String>) {
+pub fn spawn_source(settings: StreamSettings) -> Arc<SourceSession> {
     let latest = Arc::new((
         Mutex::new(FrameSlot {
             frame: None,
@@ -123,46 +126,85 @@ pub fn spawn(
         Condvar::new(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
-    let (errors, receiver) = mpsc::channel(1);
-    let frames = latest.clone();
+    let (audio, _) = broadcast::channel(32);
+    let (errors, _) = broadcast::channel(4);
     let capture_frames = latest.clone();
     let capture_stop = stop.clone();
+    let capture_audio = audio.clone();
     let capture_errors = errors.clone();
-    let capture_thread = std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("beam-capture".into())
         .spawn(move || {
-            if let Err(error) = capture_inner(capture_frames.clone(), capture_stop, audio_sender, settings) {
+            if let Err(error) = capture_inner(capture_frames.clone(), capture_stop, capture_audio, settings) {
                 tracing::error!(error = ?error, "capture stopped");
-                let _ = capture_errors.blocking_send(error.to_string());
+                let _ = capture_errors.send(error.to_string());
             }
             capture_frames.0.lock().unwrap().closed = true;
             capture_frames.1.notify_all();
         })
         .expect("capture thread");
-    let encoder_thread = std::thread::Builder::new()
+    Arc::new(SourceSession {
+        stop,
+        frames: latest,
+        audio,
+        errors,
+        thread: Some(thread),
+    })
+}
+
+pub struct EncoderSession {
+    stop: Arc<AtomicBool>,
+    frames: LatestFrame,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for EncoderSession {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+impl EncoderSession {
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.frames.1.notify_all();
+    }
+
+    pub fn shutdown(mut self) {
+        self.request_stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn spawn_encoder(
+    source: &Arc<SourceSession>,
+    sender: mpsc::Sender<EncodedFrame>,
+    settings: StreamSettings,
+) -> (EncoderSession, mpsc::Receiver<String>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (errors, receiver) = mpsc::channel(1);
+    let frames = source.frames();
+    let encoder_frames = frames.clone();
+    let encoder_stop = stop.clone();
+    let encoder_errors = errors.clone();
+    let thread = std::thread::Builder::new()
         .name("beam-ffmpeg".into())
         .spawn(move || {
-            if let Err(error) = encode(frames, sender, settings) {
+            if let Err(error) = encode(encoder_frames, encoder_stop, sender, settings) {
                 tracing::error!(error = ?error, "video encoder stopped");
-                let _ = errors.blocking_send(error.to_string());
+                let _ = encoder_errors.blocking_send(error.to_string());
             }
         })
         .expect("encoder thread");
-    (
-        Session {
-            stop,
-            frames: latest,
-            capture_thread: Some(capture_thread),
-            encoder_thread: Some(encoder_thread),
-        },
-        receiver,
-    )
+    (EncoderSession { stop, frames, thread: Some(thread) }, receiver)
 }
 
 fn capture_inner(
     latest: LatestFrame,
     stop: Arc<AtomicBool>,
-    audio_sender: mpsc::Sender<AudioFrame>,
+    audio_sender: broadcast::Sender<AudioFrame>,
     settings: StreamSettings,
 ) -> Result<()> {
     let mut capturer = CaptureSession::builder()
@@ -177,7 +219,7 @@ fn capture_inner(
     let mut last_frame = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let event = capturer
-            .next_event(Some(CAPTURE_TIMEOUT))
+            .next_event(Some(CAPTURE_EVENT_TIMEOUT))
             .map_err(|error| anyhow::anyhow!(error))?;
         match event {
             CaptureEvent::Video(frame) => {
@@ -196,9 +238,7 @@ fn capture_inner(
                 latest.1.notify_one();
             }
             CaptureEvent::Audio(frame) => {
-                if audio_sender.blocking_send(frame).is_err() {
-                    break;
-                }
+                let _ = audio_sender.send(frame);
             }
             _ if last_frame.elapsed() >= CAPTURE_TIMEOUT => {
                 bail!("screen capture produced no frames for two seconds");
@@ -210,10 +250,15 @@ fn capture_inner(
     Ok(())
 }
 
-fn encode(frames: LatestFrame, sender: mpsc::Sender<EncodedFrame>, settings: StreamSettings) -> Result<()> {
-    let Some(first) = next_frame(&frames) else { return Ok(()) };
+fn encode(
+    frames: LatestFrame,
+    stop: Arc<AtomicBool>,
+    sender: mpsc::Sender<EncodedFrame>,
+    settings: StreamSettings,
+) -> Result<()> {
+    let Some(first) = next_frame(&frames, &stop) else { return Ok(()) };
     let (width, height) = stream_dimensions(first.width, first.height, settings.resolution);
-    ffmpeg::encode(settings.codec, frames, sender, first, width, height, settings.bitrate)
+    ffmpeg::encode(settings.codec, frames, stop, sender, first, width, height, settings.bitrate)
 }
 
 pub fn stream_dimensions(source_width: usize, source_height: usize, scale: f32) -> (usize, usize) {
@@ -222,9 +267,9 @@ pub fn stream_dimensions(source_width: usize, source_height: usize, scale: f32) 
     (width, height)
 }
 
-fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
+fn next_frame(frames: &LatestFrame, stop: &AtomicBool) -> Option<Arc<RawFrame>> {
     let mut slot = frames.0.lock().unwrap();
-    while slot.frame.is_none() && !slot.closed {
+    while slot.frame.is_none() && !slot.closed && !stop.load(Ordering::Relaxed) {
         slot = frames.1.wait(slot).unwrap();
     }
     slot.frame.take()
@@ -233,41 +278,14 @@ fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     #[test]
-    fn shutdown_joins_capture_and_encoder_workers() {
+    fn stopped_encoder_does_not_wait_for_a_frame() {
         let latest = Arc::new((
             Mutex::new(FrameSlot { frame: None, closed: false }),
             Condvar::new(),
         ));
-        let stop = Arc::new(AtomicBool::new(false));
-        let joined = Arc::new(AtomicUsize::new(0));
-        let capture_joined = joined.clone();
-        let encoder_joined = joined.clone();
-        let capture_stop = stop.clone();
-        let encoder_stop = stop.clone();
-        let capture_thread = std::thread::spawn(move || {
-            while !capture_stop.load(Ordering::Relaxed) {
-                std::thread::yield_now();
-            }
-            capture_joined.fetch_add(1, Ordering::Relaxed);
-        });
-        let encoder_thread = std::thread::spawn(move || {
-            while !encoder_stop.load(Ordering::Relaxed) {
-                std::thread::yield_now();
-            }
-            encoder_joined.fetch_add(1, Ordering::Relaxed);
-        });
-
-        Session {
-            stop,
-            frames: latest,
-            capture_thread: Some(capture_thread),
-            encoder_thread: Some(encoder_thread),
-        }
-        .shutdown();
-
-        assert_eq!(joined.load(Ordering::Relaxed), 2);
+        let stop = AtomicBool::new(true);
+        assert!(next_frame(&latest, &stop).is_none());
     }
 }
