@@ -10,6 +10,7 @@ const OPUS_FRAME_DURATION: Duration = Duration::from_millis(5);
 
 pub struct Session {
     stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Session {
@@ -18,15 +19,24 @@ impl Drop for Session {
     }
 }
 
+impl Session {
+    pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub fn spawn(sender: mpsc::Sender<(Vec<u8>, Duration)>) -> (Session, mpsc::Sender<AudioFrame>) {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let (frames_sender, frames_receiver) = mpsc::channel(8);
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("beam-audio".into())
         .spawn(move || encode_audio(frames_receiver, thread_stop, sender))
         .expect("audio encoder thread");
-    (Session { stop }, frames_sender)
+    (Session { stop, thread: Some(thread) }, frames_sender)
 }
 
 fn encode_audio(

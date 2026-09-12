@@ -51,13 +51,14 @@ pub(super) fn encode(
     )
     .context("create FFmpeg video scaler")?;
     let mut previous_time = None;
+    let mut source = Some(first);
     let mut submissions: VecDeque<(i64, Instant)> = VecDeque::new();
     let mut next_pts = 0i64;
-    // Encoder initialization (codec open, thread pool start) shows up as
-    // inflated latency on the first drained batch. Consume the packets but
-    // exclude them from telemetry so codec switches don't poison averages.
+    // FFmpeg encoders are pipelined: output for a frame only appears a few
+    // sends later, so the loop must keep feeding frames and drain whatever
+    // is ready, never blocking on a single frame's packet. Each frame gets
+    // its own submit->output timer via the submission ledger.
     let mut primed = false;
-    let mut source = Some(first);
     loop {
         let Some(source) = source.take().or_else(|| next_frame(&frames)) else {
             return Ok(());
@@ -86,6 +87,7 @@ pub(super) fn encode(
             .clamp(Duration::from_millis(1), Duration::from_secs(1));
         previous_time = Some(source.captured_at);
 
+        let drained_at = Instant::now();
         let mut packets = Vec::new();
         let mut packet = ffmpeg::Packet::empty();
         while encoder.context.receive_packet(&mut packet).is_ok() {
@@ -94,18 +96,17 @@ pub(super) fn encode(
             }
             packet = ffmpeg::Packet::empty();
         }
-        let drained_at = Instant::now();
         let had_packets = !packets.is_empty();
         for (pts, data) in packets {
-            // Match by pts; threaded encoders finish packets asynchronously,
-            // so per-frame latency must be anchored to submission time, not
-            // measured across the submit/drain calls of a single iteration.
             let index = pts.and_then(|pts| submissions.iter().position(|&(p, _)| p == pts));
             let entry = match index {
                 Some(index) => submissions.remove(index),
                 None => submissions.pop_front(),
             };
-            let encode_duration = if !primed {
+            let encode_duration = if primed {
+                // First drained batch right after a codec switch includes
+                // encoder warmup; deliver those packets but keep the previous
+                // telemetry value instead of reporting the warmup spike.
                 Duration::ZERO
             } else {
                 entry

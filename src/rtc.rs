@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use webrtc::{
     api::{
         APIBuilder,
@@ -27,8 +27,14 @@ pub struct Media {
     api: webrtc::api::API,
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
+    active_session: Arc<tokio::sync::Mutex<Option<ActiveSession>>>,
     hardware_codecs: capture::HardwareCodecAvailability,
     encode_duration_us: Arc<AtomicU64>,
+}
+
+struct ActiveSession {
+    peer: Arc<RTCPeerConnection>,
+    shutdown: oneshot::Sender<()>,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +109,7 @@ impl Media {
                 .build(),
             input_tx,
             settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            active_session: Arc::new(tokio::sync::Mutex::new(None)),
             hardware_codecs: capture::ffmpeg::hardware_codecs(),
             encode_duration_us: Arc::new(AtomicU64::new(0)),
         });
@@ -110,6 +117,11 @@ impl Media {
     }
 
     pub async fn answer(&self, sdp: String) -> Result<RTCSessionDescription> {
+        if let Some(active) = self.active_session.lock().await.take() {
+            let _ = active.shutdown.send(());
+            let peer = active.peer;
+            let _ = peer.close().await;
+        }
         let settings_snapshot = *self.settings.read().await;
         let capability = match settings_snapshot.codec {
             Codec::H264 => RTCRtpCodecCapability {
@@ -126,10 +138,14 @@ impl Media {
                 .new_peer_connection(RTCConfiguration::default())
                 .await?,
         );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        *self.active_session.lock().await = Some(ActiveSession {
+            peer: peer.clone(),
+            shutdown: shutdown_tx,
+        });
         let input_tx = self.input_tx.clone();
         let settings = self.settings.clone();
         let hardware_codecs = self.hardware_codecs;
-        // NOTE: This measurement is fucking wrong and absolutely fucking braindead. This needs to be rethought.
         let encode_duration_us = self.encode_duration_us.clone();
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_tx = input_tx.clone();
@@ -256,6 +272,7 @@ impl Media {
             audio_track,
             settings_snapshot,
             self.encode_duration_us.clone(),
+            shutdown_rx,
         ));
         Ok(answer)
     }
@@ -267,17 +284,25 @@ async fn run_session(
     audio_track: Arc<TrackLocalStaticSample>,
     settings: crate::capture::StreamSettings,
     encode_duration_us: Arc<AtomicU64>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
-        while matches!(
-            peer.connection_state(),
-            RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting
-        ) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        loop {
+            if !matches!(
+                peer.connection_state(),
+                RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting
+            ) {
+                break true;
+            }
+            tokio::select! {
+                _ = &mut shutdown => break false,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
         }
     })
     .await
-    .is_ok()
+    .ok()
+        == Some(true)
         && peer.connection_state() == RTCPeerConnectionState::Connected;
     if !connected {
         let _ = peer.close().await;
@@ -290,6 +315,7 @@ async fn run_session(
     let (capture, mut capture_errors) = capture::spawn(frames_tx, audio_frames_tx, settings);
     loop {
         tokio::select! {
+            _ = &mut shutdown => break,
             error = capture_errors.recv() => {
                 if let Some(error) = error {
                     tracing::warn!(%error, "closing peer after capture failure");
@@ -298,17 +324,24 @@ async fn run_session(
             }
             frame = frames_rx.recv() => {
                 let Some(frame) = frame else { break };
-                // Zero means "warmup batch, excluded from telemetry"; skip it.
+                // Warmup packets right after a codec switch carry Duration::ZERO;
+                // keep the previous reading instead of reporting a bogus 0 ms.
                 if !frame.encode_duration.is_zero() {
                     encode_duration_us.store(frame.encode_duration.as_micros() as u64, Ordering::Relaxed);
                 }
-                if let Err(error) = track.write_sample(&Sample {
+                let sample = Sample {
                     data: frame.data.into(),
                     duration: frame.duration,
                     ..Default::default()
-                }).await {
-                    tracing::warn!(%error, "failed to send video frame");
-                    break;
+                };
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    result = track.write_sample(&sample) => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "failed to send video frame");
+                            break;
+                        }
+                    }
                 }
             }
             frame = audio_rx.recv() => {
@@ -329,7 +362,12 @@ async fn run_session(
             }
         }
     }
-    drop(capture);
-    drop(audio);
+    let _ = tokio::task::spawn_blocking(move || {
+        // Stop capture first so its audio sender is dropped; that wakes the
+        // audio worker's blocking receive before it is joined.
+        capture.shutdown();
+        audio.shutdown();
+    })
+    .await;
     let _ = peer.close().await;
 }

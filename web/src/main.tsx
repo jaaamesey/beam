@@ -200,7 +200,7 @@ function Viewer() {
               setEncodeLatency(average)
               return
             }
-           if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
+            if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
           const changed = settingsReady.current && hostSettings.current != null && (
             hostSettings.current.codec !== message.codec ||
             hostSettings.current.resolution !== message.resolution ||
@@ -283,9 +283,9 @@ function Viewer() {
           const recordLatency = (value: number) => {
             setLatency(recordLatencySample(latencySamples, value))
           }
-          const updateLatency = (_now: number, metadata: VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number }) => {
+          const updateLatency = () => {
             if (generation !== connectionGeneration.current) return
-            void measureFrameTimings(pc, performance.now(), metadata, encodeLatencyRef.current).then(timings => {
+            void measureFrameTimings(pc, encodeLatencyRef.current).then(timings => {
               if (generation !== connectionGeneration.current) return
               if (timings.age != null) recordLatency(timings.age)
               if (timings.network != null)
@@ -446,7 +446,7 @@ function Viewer() {
       <p className="mt-3 text-sm text-slate-400">
         {status}
         {status === 'connected' && latency != null && <span className="ml-2 text-slate-500">
-          · {latency} ms ({encodeLatency} ms encode, {networkLatency} ms network [PROBABLY INACCURATE])
+          · {latency} ms ({encodeLatency} ms encode, {networkLatency} ms network)
         </span>}
       </p>
     </Shell>
@@ -614,29 +614,30 @@ function recordLatencySample(samples: { current: LatencySample[] }, value: numbe
 
 async function measureFrameTimings(
   pc: RTCPeerConnection,
-  now: number,
-  metadata: VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number },
   encodeMs: number,
 ) {
-  const age = metadata.captureTime != null
-    ? now - metadata.captureTime
-    : metadata.receiveTime != null ? now - metadata.receiveTime : null
-  const network = metadata.captureTime != null && metadata.receiveTime != null
-    ? Math.max(0, metadata.receiveTime - metadata.captureTime - encodeMs)
-    : null
-  if (age != null || network != null)
-    return { age, network: network ?? Math.max(1, (age ?? 0) - encodeMs) }
-
-  const stats = await pc.getStats()
+  let roundTripTime: number | undefined
   let jitterBufferDelay: number | undefined
+  let jitterBufferEmittedCount = 0
+  const stats = await pc.getStats()
   stats.forEach(report => {
-    if (report.type === 'inbound-rtp' && report.kind === 'video' && report.jitterBufferDelay != null && report.jitterBufferEmittedCount)
-      jitterBufferDelay = report.jitterBufferDelay / report.jitterBufferEmittedCount
+    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime != null)
+      roundTripTime = report.currentRoundTripTime
+    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      if (report.jitterBufferDelay != null)
+        jitterBufferDelay = report.jitterBufferDelay
+      if (report.jitterBufferEmittedCount != null)
+        jitterBufferEmittedCount = report.jitterBufferEmittedCount
+    }
   })
-  const measuredAge = jitterBufferDelay == null ? null : jitterBufferDelay * 1000
+  const jitterMs = jitterBufferDelay != null && jitterBufferEmittedCount > 0
+    ? jitterBufferDelay * 1000 / jitterBufferEmittedCount
+    : 0
+  const network = Math.max(0, (roundTripTime ?? 0) * 500 + jitterMs)
+  const age = Math.max(0, encodeMs + network)
   return {
-    age: measuredAge,
-    network: measuredAge == null ? null : Math.max(1, measuredAge - encodeMs),
+    age,
+    network,
   }
 }
 

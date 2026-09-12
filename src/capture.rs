@@ -82,13 +82,31 @@ type LatestFrame = Arc<(Mutex<FrameSlot>, Condvar)>;
 pub struct Session {
     stop: Arc<AtomicBool>,
     frames: LatestFrame,
+    capture_thread: Option<std::thread::JoinHandle<()>>,
+    encoder_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+impl Session {
+    fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.frames.0.lock().unwrap().closed = true;
         self.frames.1.notify_all();
+    }
+
+    pub fn shutdown(mut self) {
+        self.request_stop();
+        if let Some(thread) = self.capture_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.encoder_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -110,7 +128,7 @@ pub fn spawn(
     let capture_frames = latest.clone();
     let capture_stop = stop.clone();
     let capture_errors = errors.clone();
-    std::thread::Builder::new()
+    let capture_thread = std::thread::Builder::new()
         .name("beam-capture".into())
         .spawn(move || {
             if let Err(error) = capture_inner(capture_frames.clone(), capture_stop, audio_sender, settings) {
@@ -121,7 +139,7 @@ pub fn spawn(
             capture_frames.1.notify_all();
         })
         .expect("capture thread");
-    std::thread::Builder::new()
+    let encoder_thread = std::thread::Builder::new()
         .name("beam-ffmpeg".into())
         .spawn(move || {
             if let Err(error) = encode(frames, sender, settings) {
@@ -134,6 +152,8 @@ pub fn spawn(
         Session {
             stop,
             frames: latest,
+            capture_thread: Some(capture_thread),
+            encoder_thread: Some(encoder_thread),
         },
         receiver,
     )
@@ -208,4 +228,46 @@ fn next_frame(frames: &LatestFrame) -> Option<Arc<RawFrame>> {
         slot = frames.1.wait(slot).unwrap();
     }
     slot.frame.take()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn shutdown_joins_capture_and_encoder_workers() {
+        let latest = Arc::new((
+            Mutex::new(FrameSlot { frame: None, closed: false }),
+            Condvar::new(),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicUsize::new(0));
+        let capture_joined = joined.clone();
+        let encoder_joined = joined.clone();
+        let capture_stop = stop.clone();
+        let encoder_stop = stop.clone();
+        let capture_thread = std::thread::spawn(move || {
+            while !capture_stop.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            capture_joined.fetch_add(1, Ordering::Relaxed);
+        });
+        let encoder_thread = std::thread::spawn(move || {
+            while !encoder_stop.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            encoder_joined.fetch_add(1, Ordering::Relaxed);
+        });
+
+        Session {
+            stop,
+            frames: latest,
+            capture_thread: Some(capture_thread),
+            encoder_thread: Some(encoder_thread),
+        }
+        .shutdown();
+
+        assert_eq!(joined.load(Ordering::Relaxed), 2);
+    }
 }
