@@ -92,10 +92,40 @@ jobs:
           dependencies="$(ldd target/release/beam)"
           echo "$dependencies"
           ! grep -Eiq 'lib(avcodec|avfilter|avformat|avutil|swscale|x264|x265|SvtAv1Enc).*\.so' <<< "$dependencies"
+      - name: Build AppImage
+        run: |
+          appdir=target/release/Beam.AppDir
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/Resources/web"
+          cp target/release/beam "$appdir/usr/bin/beam"
+          cp -R web/dist "$appdir/usr/Resources/web/dist"
+          cp assets/tray.svg "$appdir/Beam.svg"
+
+          cat > "$appdir/AppRun" <<'EOF'
+          #!/bin/sh
+          exec "$APPDIR/usr/bin/beam" "$@"
+          EOF
+          chmod +x "$appdir/AppRun"
+
+          cat > "$appdir/Beam.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Beam
+          Exec=beam
+          Icon=Beam
+          Categories=Utility;
+          Terminal=false
+          EOF
+
+          curl --fail --location --retry 3 \
+            --output appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
+            "$appdir" target/release/Beam-x86_64.AppImage
       - uses: actions/upload-artifact@v4
         with:
           name: beam-linux-wayland-x64
-          path: target/release/beam
+          path: target/release/Beam-x86_64.AppImage
 
   macos-arm64:
     name: macOS arm64
@@ -134,19 +164,18 @@ jobs:
         run: |
           app=target/release/bundle/osx/Beam.app
           dmg=target/release/bundle/dmg/Beam.dmg
-          archive=target/release/bundle/Beam.app.tar.gz
+          staging=$(mktemp -d)
 
           # cargo-bundle copies a linker-signed executable into the completed app.
           # Re-sign the completed bundle so Info.plist and resources are sealed.
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
 
+          cp -R "$app" "$staging/Beam.app"
+          ln -s /Applications "$staging/Applications"
           mkdir -p "$(dirname "$dmg")"
-          hdiutil create -volname Beam -srcfolder "$app" -ov -format UDZO "$dmg"
-          tar -C "$(dirname "$app")" -czf "$archive" "$(basename "$app")"
+          hdiutil create -volname Beam -srcfolder "$staging" -ov -format UDZO "$dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: beam-macos-arm64
-          path: |
-            target/release/bundle/Beam.app.tar.gz
-            target/release/bundle/dmg/Beam.dmg
+          path: target/release/bundle/dmg/Beam.dmg
