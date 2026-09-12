@@ -238,6 +238,7 @@ fn set_low_latency_options(name: &str, options: &mut Dictionary) {
         }
         name if name.ends_with("_videotoolbox") => {
             options.set("realtime", "1");
+            options.set("prio_speed", "1");
             options.set("max_ref_frames", "1");
         }
         _ => {}
