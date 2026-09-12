@@ -95,17 +95,15 @@ fn drain_packets(
     primed: &mut bool,
     duration: Duration,
 ) -> Result<bool> {
-    let mut packets = Vec::new();
     let mut packet = ffmpeg::Packet::empty();
+    let mut had_packets = false;
     while encoder.receive_packet(&mut packet).is_ok() {
-        if let Some(data) = packet.data() {
-            packets.push((packet.pts(), data.to_vec()));
-        }
-        packet = ffmpeg::Packet::empty();
-    }
-    let drained_at = Instant::now();
-    let had_packets = !packets.is_empty();
-    for (pts, data) in packets {
+        let Some(data) = packet.data() else {
+            packet = ffmpeg::Packet::empty();
+            continue;
+        };
+        let pts = packet.pts();
+        let drained_at = Instant::now();
         let index = pts.and_then(|pts| submissions.iter().position(|&(submission_pts, _)| submission_pts == pts));
         let entry = match index {
             Some(index) => submissions.remove(index),
@@ -121,7 +119,7 @@ fn drain_packets(
         };
         if sender
             .blocking_send(EncodedFrame {
-                data,
+                data: data.to_vec(),
                 duration,
                 encode_duration,
             })
@@ -129,6 +127,8 @@ fn drain_packets(
         {
             return Ok(false);
         }
+        had_packets = true;
+        packet = ffmpeg::Packet::empty();
     }
     *primed |= had_packets;
     Ok(true)
