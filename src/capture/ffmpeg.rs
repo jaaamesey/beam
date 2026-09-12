@@ -54,10 +54,9 @@ pub(super) fn encode(
     let mut source = Some(first);
     let mut submissions: VecDeque<(i64, Instant)> = VecDeque::new();
     let mut next_pts = 0i64;
-    // FFmpeg encoders are pipelined: output for a frame only appears a few
-    // sends later, so the loop must keep feeding frames and drain whatever
-    // is ready, never blocking on a single frame's packet. Each frame gets
-    // its own submit->output timer via the submission ledger.
+    // FFmpeg encoders are pipelined: keep feeding frames and drain whatever
+    // is ready. Waiting for one packet before feeding the next can deadlock
+    // encoders that need multiple input frames before producing output.
     let mut primed = false;
     loop {
         let Some(source) = source.take().or_else(|| next_frame(&frames)) else {
@@ -72,60 +71,67 @@ pub(super) fn encode(
             &mut scaler,
         )?;
         video.set_pts(Some(next_pts));
-        submissions.push_back((next_pts, Instant::now()));
-        if submissions.len() > 256 {
-            submissions.pop_front();
-        }
-        next_pts += 1;
-        encoder
-            .context
-            .send_frame(&video)
-            .context("queue FFmpeg video frame")?;
         let duration = previous_time
             .and_then(|time| source.captured_at.duration_since(time).ok())
             .unwrap_or(Duration::from_secs_f64(1.0 / FPS as f64))
             .clamp(Duration::from_millis(1), Duration::from_secs(1));
         previous_time = Some(source.captured_at);
-
-        let drained_at = Instant::now();
-        let mut packets = Vec::new();
-        let mut packet = ffmpeg::Packet::empty();
-        while encoder.context.receive_packet(&mut packet).is_ok() {
-            if let Some(data) = packet.data() {
-                packets.push((packet.pts(), data.to_vec()));
-            }
-            packet = ffmpeg::Packet::empty();
+        submissions.push_back((next_pts, Instant::now()));
+        next_pts += 1;
+        encoder
+            .context
+            .send_frame(&video)
+            .context("queue FFmpeg video frame")?;
+        if !drain_packets(&mut encoder.context, &mut submissions, &sender, &mut primed, duration)? {
+            return Ok(());
         }
-        let had_packets = !packets.is_empty();
-        for (pts, data) in packets {
-            let index = pts.and_then(|pts| submissions.iter().position(|&(p, _)| p == pts));
-            let entry = match index {
-                Some(index) => submissions.remove(index),
-                None => submissions.pop_front(),
-            };
-            let encode_duration = if primed {
-                // First drained batch right after a codec switch includes
-                // encoder warmup; deliver those packets but keep the previous
-                // telemetry value instead of reporting the warmup spike.
-                Duration::ZERO
-            } else {
-                entry
-                    .map(|(_, submitted_at)| drained_at.duration_since(submitted_at))
-                    .unwrap_or(Duration::ZERO)
-            };
-            if sender
-                .blocking_send(EncodedFrame {
-                    data,
-                    duration,
-                    encode_duration,
-                })
-                .is_err()
-            {
-                return Ok(());
-            }
-        }
-        primed |= had_packets;
     }
+}
+
+fn drain_packets(
+    encoder: &mut encoder::Video,
+    submissions: &mut VecDeque<(i64, Instant)>,
+    sender: &mpsc::Sender<EncodedFrame>,
+    primed: &mut bool,
+    duration: Duration,
+) -> Result<bool> {
+    let mut packets = Vec::new();
+    let mut packet = ffmpeg::Packet::empty();
+    while encoder.receive_packet(&mut packet).is_ok() {
+        if let Some(data) = packet.data() {
+            packets.push((packet.pts(), data.to_vec()));
+        }
+        packet = ffmpeg::Packet::empty();
+    }
+    let drained_at = Instant::now();
+    let had_packets = !packets.is_empty();
+    for (pts, data) in packets {
+        let index = pts.and_then(|pts| submissions.iter().position(|&(submission_pts, _)| submission_pts == pts));
+        let entry = match index {
+            Some(index) => submissions.remove(index),
+            None => submissions.pop_front(),
+        };
+        let encode_duration = if *primed {
+            entry
+                .as_ref()
+                .map(|&(_, submitted_at)| drained_at.duration_since(submitted_at))
+                .unwrap_or(Duration::ZERO)
+        } else {
+            Duration::ZERO
+        };
+        if sender
+            .blocking_send(EncodedFrame {
+                data,
+                duration,
+                encode_duration,
+            })
+            .is_err()
+        {
+            return Ok(false);
+        }
+    }
+    *primed |= had_packets;
+    Ok(true)
 }
 
 fn scaled_dimensions(
