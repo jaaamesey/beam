@@ -61,14 +61,17 @@ function Viewer() {
   const player = useRef<HTMLElement>(null)
   const peer = useRef<RTCPeerConnection | null>(null)
   const connectionGeneration = useRef(0)
+  const latencyFrameCallback = useRef<number | undefined>(undefined)
   const inputChannel = useRef<RTCDataChannel | null>(null)
   const settingsReady = useRef(false)
   const reconnecting = useRef(false)
   const keyboardCleanup = useRef<(() => void) | null>(null)
   const rememberedSettings = useRef(loadStreamSettings())
   const hostSettings = useRef<StreamSettings | null>(null)
+  const latencySamples = useRef<Array<{ time: number; value: number }>>([])
   const [password, setPassword] = useState('')
   const [status, setStatus] = useState('Ready')
+  const [latency, setLatency] = useState<number | null>(null)
   const [fullscreen, setFullscreen] = useState(false)
   const [streamAspect, setStreamAspect] = useState(16 / 9)
   const [clientMouseVisible, setClientMouseVisible] = useState(true)
@@ -163,6 +166,10 @@ function Viewer() {
   async function connect(event?: React.FormEvent) {
     event?.preventDefault()
     const generation = ++connectionGeneration.current
+    if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
+    latencyFrameCallback.current = undefined
+    latencySamples.current = []
+    setLatency(null)
     setStatus('Authenticating…')
     try {
       await json('/api/session', { method: 'POST', body: JSON.stringify({ password }) })
@@ -259,6 +266,24 @@ function Viewer() {
         }
         if (video.current) {
           video.current.srcObject = stream
+          const currentVideo = video.current
+          const recordLatency = (value: number) => {
+            const time = performance.now()
+            const samples = latencySamples.current
+            samples.push({ time, value: Math.max(0, value) })
+            const recent = samples.filter(sample => sample.time >= time - 1000)
+            latencySamples.current = recent
+            setLatency(Math.max(1, Math.round(recent.reduce((sum, sample) => sum + sample.value, 0) / recent.length)))
+          }
+          const updateLatency = (_now: number, metadata: VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number }) => {
+            if (generation !== connectionGeneration.current) return
+            void measureFrameAge(pc, performance.now(), metadata).then(value => {
+              if (generation === connectionGeneration.current && value != null) recordLatency(value)
+            })
+            latencyFrameCallback.current = currentVideo.requestVideoFrameCallback(updateLatency)
+          }
+          if ('requestVideoFrameCallback' in currentVideo)
+            latencyFrameCallback.current = currentVideo.requestVideoFrameCallback(updateLatency)
           video.current.onloadedmetadata = () => {
             if (video.current?.videoWidth && video.current.videoHeight)
               setStreamAspect(video.current.videoWidth / video.current.videoHeight)
@@ -286,6 +311,12 @@ function Viewer() {
       pc.onconnectionstatechange = () => {
         if (generation !== connectionGeneration.current) return
         setStatus(pc.connectionState)
+        if (pc.connectionState !== 'connected') {
+          if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
+          latencyFrameCallback.current = undefined
+          latencySamples.current = []
+          setLatency(null)
+        }
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && video.current)
           video.current.srcObject = null
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
@@ -314,6 +345,7 @@ function Viewer() {
 
   useEffect(() => () => {
     connectionGeneration.current++
+    if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
     keyboardCleanup.current?.()
     peer.current?.close()
   }, [])
@@ -395,7 +427,10 @@ function Viewer() {
           placeholder="Host password" className="min-w-0 flex-1 rounded-xl border border-white/10 bg-white/5 px-4 py-3 outline-none focus:border-cyan-300/60" />
         <button className="rounded-xl bg-cyan-300 px-6 py-3 font-semibold text-slate-950 hover:bg-cyan-200">Connect</button>
       </form>
-      <p className="mt-3 text-sm text-slate-400">{status}</p>
+      <p className="mt-3 text-sm text-slate-400">
+        {status}
+        {status === 'connected' && latency != null && <span className="ml-2 text-slate-500">· {latency} ms</span>}
+      </p>
     </Shell>
   )
 }
@@ -549,6 +584,23 @@ function waitForIce(pc: RTCPeerConnection) {
     }
     pc.addEventListener('icegatheringstatechange', listener)
   })
+}
+
+async function measureFrameAge(
+  pc: RTCPeerConnection,
+  now: number,
+  metadata: VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number },
+) {
+  const frameTime = metadata.captureTime ?? metadata.receiveTime
+  if (frameTime != null) return now - frameTime
+
+  const stats = await pc.getStats()
+  let jitterBufferDelay: number | undefined
+  stats.forEach(report => {
+    if (report.type === 'inbound-rtp' && report.kind === 'video' && report.jitterBufferDelay != null && report.jitterBufferEmittedCount)
+      jitterBufferDelay = report.jitterBufferDelay / report.jitterBufferEmittedCount
+  })
+  return jitterBufferDelay == null ? null : jitterBufferDelay * 1000
 }
 
 function streamPosition(video: HTMLVideoElement, clientX: number, clientY: number) {
