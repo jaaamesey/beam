@@ -6,7 +6,7 @@ Controllers connected to the browser (standard mapping, up to four) are forwarde
 
 Beam's settings page (tray menu, "Open Beam Settings") shows whether gamepads are ready on the host and walks you through any one-time setup. It updates by itself once you're done.
 
-- **Windows:** needs the [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver. Click "Install driver" in settings.
+- **Windows:** needs the [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver. Builds that bundle the installer start it on first run; otherwise click "Install driver" in settings.
 - **Linux:** the user running Beam needs write access to `/dev/uinput`. Settings shows the command to run.
 - **macOS:** for now, macOS hosts cannot receive gamepad input (virtual controllers need an Apple-restricted entitlement). Mouse and keyboard still work.
 

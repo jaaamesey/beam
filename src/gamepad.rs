@@ -133,6 +133,16 @@ pub fn install_driver() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Starts the bundled installer if the driver is missing. Called on first run.
+pub fn install_driver_if_missing() {
+    if matches!(platform::probe(), Status::DriverMissing)
+        && platform::installer().is_some()
+        && let Err(error) = install_driver()
+    {
+        tracing::warn!(%error, "could not start the gamepad driver installer");
+    }
+}
+
 /// One virtual controller per browser gamepad.
 pub struct Gamepads {
     devices: HashMap<u8, platform::Device>,

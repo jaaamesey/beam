@@ -419,7 +419,10 @@ function Viewer() {
         </label>
         {padConnected && hostGamepad && (hostGamepad.state === 'ready'
           ? <span className="text-emerald-300">Gamepad ready</span>
-          : <span className="text-amber-300">Gamepad won’t work yet: {gamepadNotice(hostGamepad).title.toLowerCase()}. Open Beam settings on the host.</span>)}
+          : <span className="text-amber-300">
+              Gamepad won’t work yet: {gamepadNotice(hostGamepad).title.toLowerCase()}.
+              {hostGamepad.state !== 'unsupported' && ' On the host computer, click the Beam tray icon → Open Beam Settings and follow the steps there.'}
+            </span>)}
       </section>}
       <form onSubmit={connect} className="mt-6 flex flex-col gap-3 sm:flex-row">
         <input aria-label="Host password" type="password" value={password} onChange={e => setPassword(e.target.value)}
