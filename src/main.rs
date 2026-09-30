@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 
+mod auth;
 mod capture;
 mod config;
 mod audio;
@@ -31,7 +32,7 @@ use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket},
         sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         },
         path::PathBuf,
@@ -56,6 +57,7 @@ type HttpResult<T> = Result<T, (StatusCode, String)>;
 struct App {
     config: RwLock<Config>,
     sessions: RwLock<HashMap<String, Instant>>,
+    login_limiter: Mutex<auth::LoginLimiter>,
     media: Arc<rtc::Media>,
     shutdown: Arc<AtomicBool>,
     network_address: String,
@@ -98,6 +100,7 @@ fn main() -> Result<()> {
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
+        login_limiter: Mutex::new(auth::LoginLimiter::default()),
         media: rtc::Media::new(input_tx)?,
         shutdown: shutdown_flag.clone(),
         network_address,
@@ -218,14 +221,26 @@ async fn welcome(method: Method, uri: Uri, headers: HeaderMap) -> impl IntoRespo
 
 async fn login(
     State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(input): Json<Password>,
 ) -> HttpResult<impl IntoResponse> {
+    let ip = address.ip();
+    if let Some(wait) = app.login_limiter.lock().unwrap().check(ip, Instant::now()) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("Too many attempts. Try again in {} seconds", wait.as_secs() + 1),
+        ));
+    }
     let valid: bool = input
         .password
         .as_bytes()
         .ct_eq(app.config.read().await.password.as_bytes())
         .into();
     if !valid {
+        app.login_limiter
+            .lock()
+            .unwrap()
+            .record_failure(ip, Instant::now());
         tokio::time::sleep(Duration::from_millis(250)).await;
         return Err((StatusCode::UNAUTHORIZED, "Incorrect password".into()));
     }
@@ -234,10 +249,13 @@ async fn login(
         .take(48)
         .map(char::from)
         .collect();
-    app.sessions
-        .write()
-        .await
-        .insert(token.clone(), Instant::now() + Duration::from_secs(86_400));
+    app.login_limiter.lock().unwrap().record_success(ip);
+    {
+        let now = Instant::now();
+        let mut sessions = app.sessions.write().await;
+        auth::prune_sessions(&mut sessions, now);
+        sessions.insert(token.clone(), now + Duration::from_secs(86_400));
+    }
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
