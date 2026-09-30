@@ -593,8 +593,8 @@ function GamepadCard({ token }: { token: string }) {
         health.installer_available
           ? <button type="button" onClick={() => void install()}
               className="mt-4 rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Install driver</button>
-          : <a href="https://github.com/nefarius/ViGEmBus/releases/latest" target="_blank" rel="noreferrer"
-              className="mt-4 inline-block rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Download the driver</a>
+          : <a href="https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe"
+              className="mt-4 inline-block rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Download the driver installer</a>
       )}
       {installing && !ready && <p className="mt-2 text-xs text-slate-500">Still nothing after it finishes? Restart your computer.</p>}
       {error && <p className="mt-2 text-sm text-red-300">{error}</p>}

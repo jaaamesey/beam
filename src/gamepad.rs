@@ -252,6 +252,7 @@ mod platform {
         FFEffectKind, InputEvent, InputId, KeyCode, UInputCode, UinputAbsSetup,
         uinput::VirtualDevice,
     };
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use std::{
         collections::HashMap,
         io::ErrorKind,
@@ -388,13 +389,8 @@ mod platform {
 
     fn set_nonblocking(device: &VirtualDevice) -> std::io::Result<()> {
         let fd = device.as_raw_fd();
-        // SAFETY: `fd` is owned by `device` and open.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
+        let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+        fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
         Ok(())
     }
 
