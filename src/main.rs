@@ -112,8 +112,11 @@ fn main() -> Result<()> {
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", post(login))
         .route("/api/offer", post(offer))
+        .route("/api/gamepad", get(gamepad_health))
         .route("/api/admin/settings", get(get_settings).put(put_settings))
         .route("/api/admin/settings-opened", post(settings_opened))
+        .route("/api/admin/gamepad", get(admin_gamepad_health))
+        .route("/api/admin/gamepad/install", post(install_gamepad_driver))
         .route("/api/admin/shutdown", post(shutdown))
         .fallback_service(files)
         .layer(TraceLayer::new_for_http())
@@ -262,6 +265,33 @@ async fn offer(
         .await
         .map(Json)
         .map_err(internal)
+}
+
+async fn gamepad_health(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> HttpResult<Json<gamepad::Health>> {
+    require_session(&app, &headers).await?;
+    Ok(Json(gamepad::health()))
+}
+
+async fn admin_gamepad_health(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<gamepad::Health>> {
+    require_admin(&app, address, &headers).await?;
+    Ok(Json(gamepad::health()))
+}
+
+async fn install_gamepad_driver(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<serde_json::Value>> {
+    require_admin(&app, address, &headers).await?;
+    gamepad::install_driver().map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn get_settings(
