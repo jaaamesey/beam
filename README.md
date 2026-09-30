@@ -11,3 +11,5 @@ Beam's settings page (tray menu, "Open Beam Settings") shows whether gamepads ar
 - **Windows:** needs the [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver. Release builds ship its installer next to `beam.exe` and start it on first run; if you skipped it, click "Install driver" in settings.
 - **Linux:** the user running Beam needs write access to `/dev/uinput`. Settings shows the command to run.
 - **macOS:** for now, macOS hosts cannot receive gamepad input (virtual controllers need an Apple-restricted entitlement). Mouse and keyboard still work.
+
+ViGEmBus is BSD-3-Clause licensed; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
