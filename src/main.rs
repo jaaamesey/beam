@@ -5,6 +5,7 @@
 
 mod capture;
 mod config;
+mod gamepad;
 mod audio;
 mod input;
 mod rtc;
@@ -170,15 +171,16 @@ fn main() -> Result<()> {
     let first_settings_url = settings_url.replacen("https://", "http://", 1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let (rumble_tx, _) = tokio::sync::broadcast::channel(32);
     // Linux portals serialize permission requests. Establish persistent input
     // before starting persistent capture so the input prompt cannot be delayed
     // behind the screen-capture portal session.
     let persistent_input = persistent_sessions.then(input::new).transpose()?;
-    let input_session = input::spawn(input_rx, persistent_input, shutdown_flag.clone());
+    let input_session = input::spawn(input_rx, persistent_input, shutdown_flag.clone(), rumble_tx.clone());
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
-        media: rtc::Media::new(input_tx, persistent_sessions)?,
+        media: rtc::Media::new(input_tx, rumble_tx, persistent_sessions)?,
         shutdown: shutdown_flag.clone(),
         network_address,
         logs,
@@ -189,9 +191,12 @@ fn main() -> Result<()> {
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", post(login))
         .route("/api/offer", post(offer))
+        .route("/api/gamepad", get(gamepad_health))
         .route("/api/admin/settings", get(get_settings).put(put_settings))
         .route("/api/admin/logs", get(get_logs))
         .route("/api/admin/settings-opened", post(settings_opened))
+        .route("/api/admin/gamepad", get(admin_gamepad_health))
+        .route("/api/admin/gamepad/install", post(install_gamepad_driver))
         .route("/api/admin/shutdown", post(shutdown))
         .route("/api/admin/restart", post(restart))
         .fallback_service(
@@ -204,6 +209,8 @@ fn main() -> Result<()> {
             .route("/api/admin/settings", get(get_settings).put(put_settings))
             .route("/api/admin/logs", get(get_logs))
             .route("/api/admin/settings-opened", post(settings_opened))
+            .route("/api/admin/gamepad", get(admin_gamepad_health))
+            .route("/api/admin/gamepad/install", post(install_gamepad_driver))
             .route("/api/admin/shutdown", post(shutdown))
             .route("/api/admin/restart", post(restart))
             .fallback_service(
@@ -217,8 +224,11 @@ fn main() -> Result<()> {
     let tls = tls::acceptor()?;
     runtime.spawn(run_server(listener, tls, secure, welcome_router));
     tracing::info!(address = %bound_address, "Beam is ready");
-    if open_settings && let Err(error) = open::that(&first_settings_url) {
-        tracing::warn!(%error, "could not open settings in the browser");
+    if open_settings {
+        gamepad::install_driver_if_missing();
+        if let Err(error) = open::that(&first_settings_url) {
+            tracing::warn!(%error, "could not open settings in the browser");
+        }
     }
     let result = tray::run(settings_url, shutdown_flag);
     runtime.block_on(app.media.shutdown());
@@ -414,6 +424,33 @@ async fn offer(
         .await
         .map(Json)
         .map_err(internal)
+}
+
+async fn gamepad_health(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> HttpResult<Json<gamepad::Health>> {
+    require_session(&app, &headers).await?;
+    Ok(Json(gamepad::health()))
+}
+
+async fn admin_gamepad_health(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<gamepad::Health>> {
+    require_admin(&app, address, &headers).await?;
+    Ok(Json(gamepad::health()))
+}
+
+async fn install_gamepad_driver(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<serde_json::Value>> {
+    require_admin(&app, address, &headers).await?;
+    gamepad::install_driver().map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn get_settings(

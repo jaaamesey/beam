@@ -49,10 +49,25 @@ jobs:
           if ($dependencies -match '(?i)(avcodec|avfilter|avformat|avutil|swscale|x264|x265|SvtAv1Enc).*\.dll') {
             throw "beam.exe has a dynamic FFmpeg or codec dependency"
           }
+      - name: Bundle the ViGEmBus installer
+        shell: pwsh
+        env:
+          VIGEMBUS_URL: https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe
+          VIGEMBUS_SHA256: 89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A
+        run: |
+          New-Item -ItemType Directory -Force target/release/drivers | Out-Null
+          $file = "target/release/drivers/" + [IO.Path]::GetFileName(([Uri]$env:VIGEMBUS_URL).AbsolutePath)
+          Invoke-WebRequest $env:VIGEMBUS_URL -OutFile $file
+          if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $env:VIGEMBUS_SHA256) {
+            throw "ViGEmBus installer checksum mismatch"
+          }
+          Copy-Item THIRD-PARTY-NOTICES.md target/release/drivers/
       - uses: actions/upload-artifact@v4
         with:
           name: beam-windows-x64
-          path: target/release/beam.exe
+          path: |
+            target/release/beam.exe
+            target/release/drivers
 
   linux-wayland-x64:
     name: Linux x64 Wayland

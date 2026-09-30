@@ -26,6 +26,7 @@ use crate::capture::{self, Codec};
 pub struct Media {
     api: webrtc::api::API,
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    rumble_tx: tokio::sync::broadcast::Sender<crate::gamepad::Rumble>,
     settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
     active_session: Arc<tokio::sync::Mutex<Option<ActiveSession>>>,
     persistent_source: Arc<tokio::sync::Mutex<Option<Arc<capture::SourceSession>>>>,
@@ -68,7 +69,11 @@ struct StreamStatsMessage {
 }
 
 impl Media {
-    pub fn new(input_tx: std::sync::mpsc::Sender<Vec<u8>>, persistent_sessions: bool) -> Result<Arc<Self>> {
+    pub fn new(
+        input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+        rumble_tx: tokio::sync::broadcast::Sender<crate::gamepad::Rumble>,
+        persistent_sessions: bool,
+    ) -> Result<Arc<Self>> {
         let mut engine = MediaEngine::default();
         let h264 = RTCRtpCodecCapability {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -110,6 +115,7 @@ impl Media {
                 .with_interceptor_registry(registry)
                 .build(),
             input_tx,
+            rumble_tx,
             settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
             active_session: Arc::new(tokio::sync::Mutex::new(None)),
             persistent_source: Arc::new(tokio::sync::Mutex::new(
@@ -150,11 +156,13 @@ impl Media {
             shutdown: shutdown_tx,
         });
         let input_tx = self.input_tx.clone();
+        let rumble_tx = self.rumble_tx.clone();
         let settings = self.settings.clone();
         let hardware_codecs = self.hardware_codecs;
         let encode_duration_us = self.encode_duration_us.clone();
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_tx = input_tx.clone();
+            let rumble_tx = rumble_tx.clone();
             let settings = settings.clone();
             let encode_duration_us = encode_duration_us.clone();
             Box::pin(async move {
@@ -177,7 +185,9 @@ impl Media {
                     let channel = open_channel.clone();
                     let settings = open_settings.clone();
                     let encode_duration_us = encode_duration_us.clone();
+                    let rumble = rumble_tx.subscribe();
                     Box::pin(async move {
+                        tokio::spawn(relay_rumble(channel.clone(), rumble));
                         let settings = *settings.read().await;
                         let message = serde_json::to_string(&StreamSettingsMessage {
                             r#type: "streamSettings",
@@ -301,6 +311,29 @@ impl Media {
         }
         if let Some(source) = self.persistent_source.lock().await.take() {
             source.stop();
+        }
+    }
+}
+
+async fn relay_rumble(
+    channel: Arc<RTCDataChannel>,
+    mut rumble: tokio::sync::broadcast::Receiver<crate::gamepad::Rumble>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let rumble = match rumble.recv().await {
+            Ok(rumble) => rumble,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => return,
+        };
+        let message = serde_json::json!({
+            "type": "rumble",
+            "index": rumble.index,
+            "strong": rumble.strong,
+            "weak": rumble.weak,
+        });
+        if channel.send_text(message.to_string()).await.is_err() {
+            return;
         }
     }
 }

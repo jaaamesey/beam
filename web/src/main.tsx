@@ -4,6 +4,13 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import './index.css'
 
 type Settings = { password: string; address: string; persistent_sessions: boolean }
+type GamepadHealth = {
+  state: 'ready' | 'driver_missing' | 'no_permission' | 'unsupported' | 'failed'
+  message?: string
+  platform: string
+  installer_available: boolean
+}
+const LINUX_UINPUT_SETUP = `echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/99-beam-uinput.rules && sudo usermod -aG input $USER`
 type Codec = 'h264' | 'h265' | 'av1'
 type HardwareCodecs = { h264: boolean; h265: boolean; av1: boolean }
 type StreamSettings = { codec: Codec; resolution: number; bitrate: number; host_cursor_visible: boolean }
@@ -82,6 +89,19 @@ function Viewer() {
   const [bitrate, setBitrate] = useState<number | null>(null)
   const [hostMouseVisible, setHostMouseVisible] = useState<boolean | null>(null)
   const [hardwareCodecs, setHardwareCodecs] = useState<HardwareCodecs | null>(null)
+  const [hostGamepad, setHostGamepad] = useState<GamepadHealth | null>(null)
+  const [padConnected, setPadConnected] = useState(() => navigator.getGamepads().some(pad => pad?.connected))
+
+  useEffect(() => {
+    const update = () => setPadConnected(navigator.getGamepads().some(pad => pad?.connected))
+    window.addEventListener('gamepadconnected', update)
+    window.addEventListener('gamepaddisconnected', update)
+    return () => {
+      window.removeEventListener('gamepadconnected', update)
+      window.removeEventListener('gamepaddisconnected', update)
+    }
+  }, [])
+
   async function toggleFullscreen() {
     const fullscreenDocument = document as Document & {
       webkitFullscreenElement?: Element
@@ -180,6 +200,7 @@ function Viewer() {
     setStatus('Authenticating…')
     try {
       await json('/api/session', { method: 'POST', body: JSON.stringify({ password }) })
+      json<GamepadHealth>('/api/gamepad').then(setHostGamepad).catch(() => {})
       const pc = new RTCPeerConnection({ iceServers: [] })
       keyboardCleanup.current?.()
       peer.current?.close()
@@ -189,11 +210,29 @@ function Viewer() {
       const input = pc.createDataChannel('input')
       const pointer = pc.createDataChannel('pointer', { ordered: false, maxRetransmits: 0 })
       inputChannel.current = input
+      // Browser rumble effects are short, so active ones are replayed until stopped.
+      const rumbles = new Map<number, { strong: number; weak: number }>()
+      const playRumble = (index: number) => {
+        const actuator = navigator.getGamepads()[index]?.vibrationActuator
+        const rumble = rumbles.get(index)
+        if (!actuator) return
+        if (!rumble) void actuator.reset()
+        else void actuator.playEffect('dual-rumble', {
+          duration: 1000, startDelay: 0, strongMagnitude: rumble.strong / 255, weakMagnitude: rumble.weak / 255,
+        })
+      }
+      const rumbleTimer = window.setInterval(() => rumbles.forEach((_, index) => playRumble(index)), 800)
       input.onmessage = event => {
         if (generation !== connectionGeneration.current) return
         try {
             const message = JSON.parse(event.data) as {
-              type?: string; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs; encode_ms?: number
+              type?: string; index?: number; strong?: number; weak?: number; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs; encode_ms?: number
+            }
+            if (message.type === 'rumble' && message.index != null) {
+              if (message.strong || message.weak) rumbles.set(message.index, { strong: message.strong ?? 0, weak: message.weak ?? 0 })
+              else rumbles.delete(message.index)
+              playRumble(message.index)
+              return
             }
             if (message.type === 'streamStats' && message.encode_ms != null) {
               const average = recordLatencySample(encodeLatencySamples, message.encode_ms)
@@ -263,9 +302,40 @@ function Viewer() {
       const keyUp = (event: KeyboardEvent) => sendKey('keyUp', event)
       window.addEventListener('keydown', keyDown, true)
       window.addEventListener('keyup', keyUp, true)
+      const sent = new Map<number, string>()
+      let gamepadFrame = 0
+      const pollGamepads = () => {
+        gamepadFrame = requestAnimationFrame(pollGamepads)
+        if (document.fullscreenElement !== player.current || input.readyState !== 'open') return
+        const connected = new Set<number>()
+        for (const pad of navigator.getGamepads()) {
+          if (!pad?.connected || pad.mapping !== 'standard' || pad.index > 3) continue
+          connected.add(pad.index)
+          const message = JSON.stringify({
+            type: 'gamepad',
+            index: pad.index,
+            buttons: pad.buttons.map(button => Math.round(button.value * 100) / 100),
+            axes: pad.axes.map(axis => Math.round(axis * 1000) / 1000),
+          })
+          if (sent.get(pad.index) === message) continue
+          sent.set(pad.index, message)
+          input.send(message)
+        }
+        for (const index of [...sent.keys()]) {
+          if (connected.has(index)) continue
+          sent.delete(index)
+          input.send(JSON.stringify({ type: 'gamepadDisconnected', index }))
+        }
+      }
+      gamepadFrame = requestAnimationFrame(pollGamepads)
       keyboardCleanup.current = () => {
         window.removeEventListener('keydown', keyDown, true)
         window.removeEventListener('keyup', keyUp, true)
+        cancelAnimationFrame(gamepadFrame)
+        window.clearInterval(rumbleTimer)
+        const active = [...rumbles.keys()]
+        rumbles.clear()
+        active.forEach(playRumble)
       }
       pc.ontrack = ({ receiver, streams: [stream] }) => {
         const lowLatency = receiver as RTCRtpReceiver & {
@@ -438,6 +508,12 @@ function Viewer() {
             {[1, 5, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100, 150, 200].map(value => <option key={value} value={value}>{value} Mbps</option>)}
           </select>
         </label>
+        {padConnected && hostGamepad && (hostGamepad.state === 'ready'
+          ? <span className="text-emerald-300">Gamepad ready</span>
+          : <span className="text-amber-300">
+              Gamepad won’t work yet: {gamepadNotice(hostGamepad).title.toLowerCase()}.
+              {hostGamepad.state !== 'unsupported' && ' On the host computer, click the Beam tray icon → Open Beam Settings and follow the steps there.'}
+            </span>)}
       </section>}
       <form onSubmit={connect} className="mt-6 flex flex-col gap-3 sm:flex-row">
         <input aria-label="Host password" type="password" value={password} onChange={e => setPassword(e.target.value)}
@@ -451,6 +527,78 @@ function Viewer() {
         </span>}
       </p>
     </Shell>
+  )
+}
+
+function gamepadNotice(health: GamepadHealth) {
+  switch (health.state) {
+    case 'ready':
+      return { ok: true, title: 'Gamepads are ready', detail: 'Controllers plugged into a client show up on this computer as Xbox controllers.', command: '' }
+    case 'driver_missing':
+      return health.platform === 'windows'
+        ? { ok: false, title: 'One-time driver install needed', detail: 'Gamepads need the ViGEmBus driver. It takes about a minute and asks for admin permission.', command: '' }
+        : { ok: false, title: 'Gamepad module isn’t loaded', detail: 'Run this once, then reload this page.', command: 'sudo modprobe uinput' }
+    case 'no_permission':
+      return { ok: false, title: 'Beam can’t use /dev/uinput', detail: 'Run this once, then log out and back in.', command: LINUX_UINPUT_SETUP }
+    case 'unsupported':
+      return { ok: false, title: 'Gamepads aren’t supported on this computer yet', detail: 'Mouse and keyboard still work.', command: '' }
+    default:
+      return { ok: false, title: 'Gamepads aren’t working', detail: health.message ?? 'Unknown error', command: '' }
+  }
+}
+
+function GamepadCard({ token }: { token: string }) {
+  const [health, setHealth] = useState<GamepadHealth | null>(null)
+  const [installing, setInstalling] = useState(false)
+  const [error, setError] = useState('')
+  const ready = health?.state === 'ready'
+
+  useEffect(() => {
+    let stopped = false
+    const refresh = () => json<GamepadHealth>('/api/admin/gamepad', { headers: { authorization: `Bearer ${token}` } })
+      .then(value => { if (!stopped) setHealth(value) })
+      .catch(() => {})
+    void refresh()
+    const timer = ready ? undefined : window.setInterval(refresh, 2000)
+    return () => {
+      stopped = true
+      window.clearInterval(timer)
+    }
+  }, [token, ready])
+
+  async function install() {
+    setError('')
+    try {
+      await json('/api/admin/gamepad/install', { method: 'POST', headers: { authorization: `Bearer ${token}` } })
+      setInstalling(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not start the installer')
+    }
+  }
+
+  if (!health) return null
+  const notice = gamepadNotice(health)
+  return (
+    <section className="mt-8 border-t border-white/10 pt-6">
+      <h2 className="text-xl font-semibold tracking-tight">Gamepads</h2>
+      <div className="mt-3 flex items-center gap-2">
+        <span className={`size-2.5 rounded-full ${notice.ok ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+        <span className="font-medium">{notice.title}</span>
+      </div>
+      <p className="mt-2 text-sm leading-6 text-slate-400">
+        {installing && !ready ? 'Finish the installer window that just opened. This updates by itself.' : notice.detail}
+      </p>
+      {notice.command && !ready && <code className="mt-3 block select-all break-all rounded-xl bg-black/30 px-4 py-3 text-xs text-slate-300">{notice.command}</code>}
+      {health.state === 'driver_missing' && health.platform === 'windows' && !installing && (
+        health.installer_available
+          ? <button type="button" onClick={() => void install()}
+              className="mt-4 rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Install driver</button>
+          : <a href="https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe"
+              className="mt-4 inline-block rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Download the driver installer</a>
+      )}
+      {installing && !ready && <p className="mt-2 text-xs text-slate-500">Still nothing after it finishes? Restart your computer.</p>}
+      {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
+    </section>
   )
 }
 
@@ -588,6 +736,7 @@ function SettingsPage() {
             </button>
           </div>
         </form>
+        <GamepadCard token={token} />
         <section className="mt-8 border-t border-white/10 pt-6">
           <label className="mt-4 flex items-start gap-3 text-sm text-slate-300">
             <input type="checkbox" checked={persistentSessions}

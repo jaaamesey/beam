@@ -1,3 +1,4 @@
+use crate::gamepad::{self, Gamepads};
 use display_info::DisplayInfo;
 use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
@@ -6,6 +7,7 @@ use std::{
     sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}, mpsc::Receiver},
     time::Duration,
 };
+use tokio::sync::broadcast;
 
 thread_local! {
     static SCROLL_REMAINDER: RefCell<(f64, f64)> = const { RefCell::new((0.0, 0.0)) };
@@ -39,16 +41,23 @@ pub fn spawn(
     receiver: Receiver<Vec<u8>>,
     initial: Option<Enigo>,
     shutdown: Arc<AtomicBool>,
+    rumble: broadcast::Sender<gamepad::Rumble>,
 ) -> Session {
     let thread_shutdown = shutdown.clone();
     let thread = std::thread::Builder::new()
         .name("beam-input".into())
-        .spawn(move || run(receiver, initial, thread_shutdown))
+        .spawn(move || run(receiver, initial, thread_shutdown, rumble))
         .expect("input thread");
     Session { shutdown, thread: Some(thread) }
 }
 
-fn run(receiver: Receiver<Vec<u8>>, mut enigo: Option<Enigo>, shutdown: Arc<AtomicBool>) {
+fn run(
+    receiver: Receiver<Vec<u8>>,
+    mut enigo: Option<Enigo>,
+    shutdown: Arc<AtomicBool>,
+    rumble: broadcast::Sender<gamepad::Rumble>,
+) {
+    let mut gamepads = Gamepads::new(rumble);
     while !shutdown.load(Ordering::Relaxed) {
         let first = match receiver.recv_timeout(Duration::from_millis(2)) {
             Ok(message) => message,
@@ -56,7 +65,7 @@ fn run(receiver: Receiver<Vec<u8>>, mut enigo: Option<Enigo>, shutdown: Arc<Atom
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         process_batch(std::iter::once(first).chain(receiver.try_iter()), |message| {
-            handle_with_session(&mut enigo, &message);
+            handle_with_session(&mut enigo, &mut gamepads, &message);
         });
     }
 }
@@ -81,12 +90,19 @@ fn process_batch(
     }
 }
 
-fn handle_with_session(enigo: &mut Option<Enigo>, message: &[u8]) {
-    if enigo.is_none() {
-        *enigo = new().map_err(|error| tracing::error!(%error, "could not initialise native input")).ok();
-    }
-    if let Some(enigo) = enigo.as_mut() {
-        handle(enigo, message);
+fn handle_with_session(enigo: &mut Option<Enigo>, gamepads: &mut Gamepads, message: &[u8]) {
+    match serde_json::from_slice::<Message>(message) {
+        Ok(Message::Gamepad { index, state }) => gamepads.update(index, &state),
+        Ok(Message::GamepadDisconnected { index }) => gamepads.disconnect(index),
+        Ok(message) => {
+            if enigo.is_none() {
+                *enigo = new().map_err(|error| tracing::error!(%error, "could not initialise native input")).ok();
+            }
+            if let Some(enigo) = enigo.as_mut() {
+                handle(enigo, message);
+            }
+        }
+        Err(_) => {}
     }
 }
 
@@ -110,6 +126,14 @@ pub(crate) enum Message {
     KeyUp { code: String, key: String },
     #[serde(rename = "mouseButton")]
     MouseButton { button: u16, down: bool },
+    #[serde(rename = "gamepad")]
+    Gamepad {
+        index: u8,
+        #[serde(flatten)]
+        state: gamepad::State,
+    },
+    #[serde(rename = "gamepadDisconnected")]
+    GamepadDisconnected { index: u8 },
 }
 
 pub fn is_mouse_move(message: &[u8]) -> bool {
@@ -120,10 +144,7 @@ pub fn new() -> anyhow::Result<Enigo> {
     Ok(Enigo::new(&Settings::default())?)
 }
 
-pub fn handle(enigo: &mut Enigo, message: &[u8]) {
-    let Ok(message) = serde_json::from_slice::<Message>(message) else {
-        return;
-    };
+fn handle(enigo: &mut Enigo, message: Message) {
     match message {
         Message::MouseMove { x, y } => move_mouse(enigo, x, y),
         Message::Wheel {
@@ -134,6 +155,7 @@ pub fn handle(enigo: &mut Enigo, message: &[u8]) {
         Message::KeyDown { code, key } => key_event(enigo, &code, &key, Direction::Press),
         Message::KeyUp { code, key } => key_event(enigo, &code, &key, Direction::Release),
         Message::MouseButton { button, down } => mouse_button(enigo, button, down),
+        Message::Gamepad { .. } | Message::GamepadDisconnected { .. } => {}
     }
 }
 
