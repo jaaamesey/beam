@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::broadcast;
 
@@ -97,6 +98,41 @@ fn combine(effects: impl Iterator<Item = (u16, u16)>, gain: u16) -> (u8, u8) {
     (scale(strong), scale(weak))
 }
 
+/// Whether this host can create virtual controllers right now.
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Status {
+    Ready,
+    /// ViGEmBus on Windows, the uinput module on Linux.
+    DriverMissing,
+    NoPermission,
+    Unsupported,
+    Failed { message: String },
+}
+
+#[derive(Serialize)]
+pub struct Health {
+    #[serde(flatten)]
+    pub status: Status,
+    pub platform: &'static str,
+    pub installer_available: bool,
+}
+
+pub fn health() -> Health {
+    Health {
+        status: platform::probe(),
+        platform: std::env::consts::OS,
+        installer_available: platform::installer().is_some(),
+    }
+}
+
+/// Opens the bundled driver installer; Windows asks the user for permission.
+pub fn install_driver() -> anyhow::Result<()> {
+    let installer = platform::installer().context("this build doesn't include the driver installer")?;
+    open::that(installer)?;
+    Ok(())
+}
+
 /// One virtual controller per browser gamepad.
 pub struct Gamepads {
     devices: HashMap<u8, platform::Device>,
@@ -152,8 +188,26 @@ impl Gamepads {
 #[cfg(windows)]
 mod platform {
     use super::Report;
-    use std::sync::Arc;
-    use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
+    use super::Status;
+    use std::{path::PathBuf, sync::Arc};
+    use vigem_client::{Client, Error, TargetId, XButtons, XGamepad, Xbox360Wired};
+
+    pub fn probe() -> Status {
+        match Client::connect() {
+            Ok(_) => Status::Ready,
+            Err(Error::BusNotFound) => Status::DriverMissing,
+            Err(error) => Status::Failed { message: error.to_string() },
+        }
+    }
+
+    /// The ViGEmBus installer shipped in a `drivers` folder next to beam.exe.
+    pub fn installer() -> Option<PathBuf> {
+        let folder = std::env::current_exe().ok()?.parent()?.join("drivers");
+        std::fs::read_dir(folder).ok()?.filter_map(Result::ok).map(|entry| entry.path()).find(|path| {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_ascii_lowercase();
+            name.starts_with("vigembus") && (name.ends_with(".msi") || name.ends_with(".exe"))
+        })
+    }
 
     /// Needs the ViGEmBus driver.
     pub struct Device(Xbox360Wired<Arc<Client>>);
@@ -189,7 +243,7 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{Report, button};
+    use super::{Report, Status, button};
     use evdev::{
         AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventSummary, EventType, FFEffectCode,
         FFEffectKind, InputEvent, InputId, KeyCode, UInputCode, UinputAbsSetup,
@@ -210,6 +264,19 @@ mod platform {
     }
 
     const MAX_EFFECTS: i16 = 16;
+
+    pub fn probe() -> Status {
+        match std::fs::OpenOptions::new().write(true).open("/dev/uinput") {
+            Ok(_) => Status::Ready,
+            Err(error) if error.kind() == ErrorKind::NotFound => Status::DriverMissing,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => Status::NoPermission,
+            Err(error) => Status::Failed { message: error.to_string() },
+        }
+    }
+
+    pub fn installer() -> Option<std::path::PathBuf> {
+        None
+    }
 
     const KEYS: [(u16, KeyCode); 11] = [
         (button::A, KeyCode::BTN_SOUTH),
@@ -409,7 +476,15 @@ mod platform {
 /// No supported way to create a virtual controller here (needs a signed driver extension).
 #[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
-    use super::Report;
+    use super::{Report, Status};
+
+    pub fn probe() -> Status {
+        Status::Unsupported
+    }
+
+    pub fn installer() -> Option<std::path::PathBuf> {
+        None
+    }
 
     pub struct Device;
 
@@ -474,6 +549,21 @@ mod tests {
         assert_eq!(combine([(0x4000, 0), (0x4000, 0)].into_iter(), u16::MAX), (128, 0));
         assert_eq!(combine([(0xffff, 0xffff), (0xffff, 0)].into_iter(), u16::MAX), (255, 255));
         assert_eq!(combine([(0xffff, 0xffff)].into_iter(), 0x8000), (128, 128));
+    }
+
+    #[test]
+    fn health_serializes_flat() {
+        let health = Health {
+            status: Status::DriverMissing,
+            platform: "windows",
+            installer_available: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&health).unwrap(),
+            r#"{"state":"driver_missing","platform":"windows","installer_available":true}"#
+        );
+        let failed = serde_json::to_string(&Status::Failed { message: "x".into() }).unwrap();
+        assert_eq!(failed, r#"{"state":"failed","message":"x"}"#);
     }
 
     #[test]
