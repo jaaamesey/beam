@@ -1,33 +1,114 @@
-use display_info::DisplayInfo;
 use crate::gamepad::{self, Gamepads};
+use display_info::DisplayInfo;
 use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}, mpsc::Receiver},
+    time::Duration,
+};
 use tokio::sync::broadcast;
 
 thread_local! {
     static SCROLL_REMAINDER: RefCell<(f64, f64)> = const { RefCell::new((0.0, 0.0)) };
 }
 
-pub fn check_permissions() {
-    #[cfg(target_os = "macos")]
-    if !macos_accessibility_client::accessibility::application_is_trusted_with_prompt() {
-        tracing::warn!(
-            "Beam is not trusted for Accessibility; enable it in System Settings > Privacy & Security > Accessibility"
-        );
-    }
+#[derive(Clone, Copy)]
+struct DisplayBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
 
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        tracing::info!(
-            "Wayland detected; Beam will use the compositor/libei input backend if supported"
-        );
+static PRIMARY_DISPLAY: OnceLock<Option<DisplayBounds>> = OnceLock::new();
+
+pub struct Session {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Session {
+    pub fn shutdown(mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn spawn(
+    receiver: Receiver<Vec<u8>>,
+    initial: Option<Enigo>,
+    shutdown: Arc<AtomicBool>,
+    rumble: broadcast::Sender<gamepad::Rumble>,
+) -> Session {
+    let thread_shutdown = shutdown.clone();
+    let thread = std::thread::Builder::new()
+        .name("beam-input".into())
+        .spawn(move || run(receiver, initial, thread_shutdown, rumble))
+        .expect("input thread");
+    Session { shutdown, thread: Some(thread) }
+}
+
+fn run(
+    receiver: Receiver<Vec<u8>>,
+    mut enigo: Option<Enigo>,
+    shutdown: Arc<AtomicBool>,
+    rumble: broadcast::Sender<gamepad::Rumble>,
+) {
+    let mut gamepads = Gamepads::new(rumble);
+    while !shutdown.load(Ordering::Relaxed) {
+        let first = match receiver.recv_timeout(Duration::from_millis(2)) {
+            Ok(message) => message,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        process_batch(std::iter::once(first).chain(receiver.try_iter()), |message| {
+            handle_with_session(&mut enigo, &mut gamepads, &message);
+        });
+    }
+}
+
+fn process_batch(
+    messages: impl IntoIterator<Item = Vec<u8>>,
+    mut handle: impl FnMut(Vec<u8>),
+) {
+    let mut latest_mouse_move = None;
+    for message in messages {
+        if is_mouse_move(&message) {
+            latest_mouse_move = Some(message);
+        } else {
+            if let Some(message) = latest_mouse_move.take() {
+                handle(message);
+            }
+            handle(message);
+        }
+    }
+    if let Some(message) = latest_mouse_move {
+        handle(message);
+    }
+}
+
+fn handle_with_session(enigo: &mut Option<Enigo>, gamepads: &mut Gamepads, message: &[u8]) {
+    match serde_json::from_slice::<Message>(message) {
+        Ok(Message::Gamepad { index, state }) => gamepads.update(index, &state),
+        Ok(Message::GamepadDisconnected { index }) => gamepads.disconnect(index),
+        Ok(message) => {
+            if enigo.is_none() {
+                *enigo = new().map_err(|error| tracing::error!(%error, "could not initialise native input")).ok();
+            }
+            if let Some(enigo) = enigo.as_mut() {
+                handle(enigo, message);
+            }
+        }
+        Err(_) => {}
     }
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum Message {
+pub(crate) enum Message {
     #[serde(rename = "mouseMove")]
     MouseMove { x: f64, y: f64 },
     #[serde(rename = "wheel")]
@@ -55,23 +136,15 @@ enum Message {
     GamepadDisconnected { index: u8 },
 }
 
-pub struct Input {
-    enigo: Enigo,
-    gamepads: Gamepads,
+pub fn is_mouse_move(message: &[u8]) -> bool {
+    matches!(serde_json::from_slice::<Message>(message), Ok(Message::MouseMove { .. }))
 }
 
-pub fn new(rumble: broadcast::Sender<gamepad::Rumble>) -> anyhow::Result<Input> {
-    Ok(Input {
-        enigo: Enigo::new(&Settings::default())?,
-        gamepads: Gamepads::new(rumble),
-    })
+pub fn new() -> anyhow::Result<Enigo> {
+    Ok(Enigo::new(&Settings::default())?)
 }
 
-pub fn handle(input: &mut Input, message: &[u8]) {
-    let Input { enigo, gamepads } = input;
-    let Ok(message) = serde_json::from_slice::<Message>(message) else {
-        return;
-    };
+fn handle(enigo: &mut Enigo, message: Message) {
     match message {
         Message::MouseMove { x, y } => move_mouse(enigo, x, y),
         Message::Wheel {
@@ -82,8 +155,7 @@ pub fn handle(input: &mut Input, message: &[u8]) {
         Message::KeyDown { code, key } => key_event(enigo, &code, &key, Direction::Press),
         Message::KeyUp { code, key } => key_event(enigo, &code, &key, Direction::Release),
         Message::MouseButton { button, down } => mouse_button(enigo, button, down),
-        Message::Gamepad { index, state } => gamepads.update(index, &state),
-        Message::GamepadDisconnected { index } => gamepads.disconnect(index),
+        Message::Gamepad { .. } | Message::GamepadDisconnected { .. } => {}
     }
 }
 
@@ -163,22 +235,38 @@ fn move_mouse(enigo: &mut Enigo, x: f64, y: f64) {
     if !x.is_finite() || !y.is_finite() {
         return;
     }
-    let displays = match DisplayInfo::all() {
-        Ok(displays) => displays,
-        Err(error) => {
-            tracing::warn!(%error, "could not enumerate displays for mouse input");
-            return;
-        }
-    };
-    let Some(display) = displays.iter().find(|display| display.is_primary).or(displays.first()) else {
+    let Some(display) = PRIMARY_DISPLAY.get_or_init(|| {
+        let displays = match DisplayInfo::all() {
+            Ok(displays) => displays,
+            Err(error) => {
+                tracing::warn!(%error, "could not enumerate displays for mouse input");
+                return None;
+            }
+        };
+        let display = displays.iter().find(|display| display.is_primary).or(displays.first())?;
+        Some(DisplayBounds {
+            x: display.x,
+            y: display.y,
+            width: display.width,
+            height: display.height,
+        })
+    }) else {
         tracing::warn!("no display available for mouse input");
         return;
     };
-    let x = display.x + (x.clamp(0.0, 1.0) * (display.width.saturating_sub(1) as f64)) as i32;
-    let y = display.y + (y.clamp(0.0, 1.0) * (display.height.saturating_sub(1) as f64)) as i32;
+    let (x, y) = map_position(*display, x, y, cfg!(target_os = "linux"));
     if let Err(error) = enigo.move_mouse(x, y, Coordinate::Abs) {
         tracing::warn!(%error, "could not move native mouse");
     }
+}
+
+fn map_position(display: DisplayBounds, x: f64, y: f64, local_origin: bool) -> (i32, i32) {
+    let offset_x = if local_origin { 0 } else { display.x };
+    let offset_y = if local_origin { 0 } else { display.y };
+    (
+        offset_x + (x.clamp(0.0, 1.0) * display.width.saturating_sub(1) as f64) as i32,
+        offset_y + (y.clamp(0.0, 1.0) * display.height.saturating_sub(1) as f64) as i32,
+    )
 }
 
 fn scroll(enigo: &mut Enigo, delta_x: f64, delta_y: f64, delta_mode: u32) {
@@ -210,5 +298,34 @@ fn scroll(enigo: &mut Enigo, delta_x: f64, delta_y: f64, delta_mode: u32) {
         && let Err(error) = enigo.scroll(vertical, enigo::Axis::Vertical)
     {
         tracing::warn!(%error, "could not scroll vertically");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_only_consecutive_mouse_moves() {
+        let move_one = br#"{"type":"mouseMove","x":0.1,"y":0.1}"#.to_vec();
+        let move_two = br#"{"type":"mouseMove","x":0.2,"y":0.2}"#.to_vec();
+        let click = br#"{"type":"mouseButton","button":0,"down":true}"#.to_vec();
+        let move_three = br#"{"type":"mouseMove","x":0.3,"y":0.3}"#.to_vec();
+        let mut output = Vec::new();
+
+        process_batch(
+            vec![move_one, move_two.clone(), click.clone(), move_three.clone()],
+            |message| output.push(message),
+        );
+
+        assert_eq!(output, vec![move_two, click, move_three]);
+    }
+
+    #[test]
+    fn linux_pointer_coordinates_are_local_to_the_capture_region() {
+        let display = DisplayBounds { x: 1920, y: 200, width: 1920, height: 1080 };
+        assert_eq!(map_position(display, 0.0, 0.0, true), (0, 0));
+        assert_eq!(map_position(display, 1.0, 1.0, true), (1919, 1079));
+        assert_eq!(map_position(display, 0.0, 0.0, false), (1920, 200));
     }
 }

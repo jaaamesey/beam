@@ -29,14 +29,17 @@ use hyper_util::{
 use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    io::{self, Write},
     net::{SocketAddr, UdpSocket},
-        sync::{
+    process::Command,
+    sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        },
-        path::PathBuf,
-        time::{Duration, Instant},
+        Mutex,
+    },
+    path::PathBuf,
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -49,9 +52,11 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use tracing_subscriber::fmt::MakeWriter;
 
 const PORT: u16 = 9470;
 const COOKIE: &str = "beam_session";
+const RESTART_CHILD: &str = "--beam-restart-child";
 type HttpResult<T> = Result<T, (StatusCode, String)>;
 
 struct App {
@@ -60,6 +65,42 @@ struct App {
     media: Arc<rtc::Media>,
     shutdown: Arc<AtomicBool>,
     network_address: String,
+    logs: LogBuffer,
+}
+
+const MAX_LOG_BYTES: usize = 100_000;
+
+#[derive(Clone, Default)]
+struct LogBuffer {
+    bytes: Arc<Mutex<VecDeque<u8>>>,
+}
+
+struct LogWriter {
+    logs: LogBuffer,
+}
+
+impl<'a> MakeWriter<'a> for LogBuffer {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter { logs: self.clone() }
+    }
+}
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::stderr().write_all(bytes)?;
+        let mut log = self.logs.bytes.lock().unwrap();
+        log.extend(bytes);
+        while log.len() > MAX_LOG_BYTES {
+            log.pop_front();
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -67,10 +108,22 @@ struct Password {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    password: String,
+    persistent_sessions: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct Settings {
     password: String,
     address: String,
+    persistent_sessions: bool,
+}
+
+#[derive(Serialize)]
+struct Logs {
+    logs: String,
 }
 
 #[derive(Deserialize)]
@@ -79,59 +132,162 @@ struct Offer {
 }
 
 fn main() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|argument| argument == RESTART_CHILD) {
+        wait_for_port(PORT);
+        return replace_process(arguments.into_iter().skip(1).collect());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-restarted") {
+        println!("restart self-test passed: second process generation started");
+        return Ok(());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-watcher-restarted") {
+        println!("restart watcher self-test passed: second process generation started");
+        return Ok(());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-watcher") {
+        spawn_restart_watcher()?;
+        return Ok(());
+    }
+    if arguments.iter().any(|argument| argument == "--beam-self-test-restart") {
+        return restart_process_with_args(["--beam-self-test-restarted"]);
+    }
+    let logs = LogBuffer::default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("beam=info".parse()?),
         )
+        .with_writer(logs.clone())
         .init();
-
-    input::check_permissions();
 
     let runtime = tokio::runtime::Runtime::new()?;
     let listener = runtime.block_on(TcpListener::bind(("0.0.0.0", PORT)))?;
     let bound_address = listener.local_addr()?;
     let config = Config::load()?;
+    let persistent_sessions = config.persistent_sessions;
     let network_address = format!("http://{}:{PORT}", local_ip());
     let open_settings = !Config::settings_opened()?;
     let settings_url = format!("https://127.0.0.1:{PORT}/settings#{}", config.admin_token);
+    let first_settings_url = settings_url.replacen("https://", "http://", 1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     let (rumble_tx, _) = tokio::sync::broadcast::channel(32);
+    // Linux portals serialize permission requests. Establish persistent input
+    // before starting persistent capture so the input prompt cannot be delayed
+    // behind the screen-capture portal session.
+    let persistent_input = persistent_sessions.then(input::new).transpose()?;
+    let input_session = input::spawn(input_rx, persistent_input, shutdown_flag.clone(), rumble_tx.clone());
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
-        media: rtc::Media::new(input_tx, rumble_tx.clone())?,
+        media: rtc::Media::new(input_tx, rumble_tx, persistent_sessions)?,
         shutdown: shutdown_flag.clone(),
         network_address,
+        logs,
     });
 
     let web_root = resource_path("web/dist");
-    let files = ServeDir::new(&web_root)
-        .not_found_service(ServeFile::new(web_root.join("index.html")));
     let secure = Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", post(login))
         .route("/api/offer", post(offer))
         .route("/api/gamepad", get(gamepad_health))
         .route("/api/admin/settings", get(get_settings).put(put_settings))
+        .route("/api/admin/logs", get(get_logs))
         .route("/api/admin/settings-opened", post(settings_opened))
         .route("/api/admin/gamepad", get(admin_gamepad_health))
         .route("/api/admin/gamepad/install", post(install_gamepad_driver))
         .route("/api/admin/shutdown", post(shutdown))
-        .fallback_service(files)
+        .route("/api/admin/restart", post(restart))
+        .fallback_service(
+            ServeDir::new(&web_root).not_found_service(ServeFile::new(web_root.join("index.html"))),
+        )
         .layer(TraceLayer::new_for_http())
-        .with_state(app);
-    let welcome = Router::new().fallback(welcome);
+        .with_state(app.clone());
+    let welcome_router = if open_settings {
+        Router::new()
+            .route("/api/admin/settings", get(get_settings).put(put_settings))
+            .route("/api/admin/logs", get(get_logs))
+            .route("/api/admin/settings-opened", post(settings_opened))
+            .route("/api/admin/gamepad", get(admin_gamepad_health))
+            .route("/api/admin/gamepad/install", post(install_gamepad_driver))
+            .route("/api/admin/shutdown", post(shutdown))
+            .route("/api/admin/restart", post(restart))
+            .fallback_service(
+                ServeDir::new(&web_root)
+                    .not_found_service(ServeFile::new(web_root.join("index.html"))),
+            )
+            .with_state(app.clone())
+    } else {
+        Router::new().fallback(welcome).with_state(app.clone())
+    };
     let tls = tls::acceptor()?;
-    runtime.spawn(run_server(listener, tls, secure, welcome));
+    runtime.spawn(run_server(listener, tls, secure, welcome_router));
     tracing::info!(address = %bound_address, "Beam is ready");
     if open_settings {
         gamepad::install_driver_if_missing();
-        if let Err(error) = open::that(&settings_url) {
+        if let Err(error) = open::that(&first_settings_url) {
             tracing::warn!(%error, "could not open settings in the browser");
         }
     }
-    tray::run(settings_url, shutdown_flag, input_rx, rumble_tx)
+    let result = tray::run(settings_url, shutdown_flag);
+    runtime.block_on(app.media.shutdown());
+    input_session.shutdown();
+    drop(app);
+    drop(runtime);
+    result
+}
+
+pub(crate) fn spawn_restart_watcher() -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg(RESTART_CHILD)
+        .args(std::env::args_os().skip(1));
+    if std::env::args().any(|argument| argument == "--beam-self-test-watcher") {
+        command.arg("--beam-self-test-watcher-restarted");
+    }
+    command
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("start Beam restart watcher: {error}"))?;
+    Ok(())
+}
+
+fn wait_for_port(port: u16) {
+    while std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn restart_process_with_args<const N: usize>(extra_args: [&str; N]) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    command.args(extra_args);
+    replace_command(command)
+}
+
+fn replace_process(arguments: Vec<std::ffi::OsString>) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command.args(arguments);
+    replace_command(command)
+}
+
+fn replace_command(mut command: Command) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        return Err(anyhow::anyhow!("restart Beam server: {error}"));
+    }
+    #[cfg(not(unix))]
+    {
+        command
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("restart Beam server: {error}"))?;
+        Ok(())
+    }
 }
 
 fn resource_path(relative: &str) -> PathBuf {
@@ -306,6 +462,19 @@ async fn get_settings(
     Ok(Json(Settings {
         password: app.config.read().await.password.clone(),
         address: app.network_address.clone(),
+        persistent_sessions: app.config.read().await.persistent_sessions,
+    }))
+}
+
+async fn get_logs(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<Logs>> {
+    require_admin(&app, address, &headers).await?;
+    let bytes: Vec<u8> = app.logs.bytes.lock().unwrap().iter().copied().collect();
+    Ok(Json(Logs {
+        logs: String::from_utf8_lossy(&bytes).into_owned(),
     }))
 }
 
@@ -313,7 +482,7 @@ async fn put_settings(
     State(app): State<Arc<App>>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(input): Json<Password>,
+    Json(input): Json<SettingsUpdate>,
 ) -> HttpResult<Json<serde_json::Value>> {
     require_admin(&app, address, &headers).await?;
     if input.password.len() < 4 {
@@ -322,9 +491,11 @@ async fn put_settings(
             "Password must be at least 4 characters".into(),
         ));
     }
+    let current = app.config.read().await.clone();
     let config = Config {
         password: input.password,
-        admin_token: app.config.read().await.admin_token.clone(),
+        admin_token: current.admin_token,
+        persistent_sessions: input.persistent_sessions.unwrap_or(current.persistent_sessions),
     };
     config.save().map_err(internal)?;
     *app.config.write().await = config;
@@ -338,6 +509,21 @@ async fn shutdown(
     headers: HeaderMap,
 ) -> HttpResult<Json<serde_json::Value>> {
     require_admin(&app, address, &headers).await?;
+    let shutdown = app.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.store(true, Ordering::Relaxed);
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn restart(
+    State(app): State<Arc<App>>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> HttpResult<Json<serde_json::Value>> {
+    require_admin(&app, address, &headers).await?;
+    spawn_restart_watcher().map_err(internal)?;
     let shutdown = app.shutdown.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -435,5 +621,19 @@ mod tests {
                 .0,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[test]
+    fn restart_waits_until_the_server_port_is_released() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(listener);
+        });
+        let started = Instant::now();
+        wait_for_port(port);
+        release.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 }

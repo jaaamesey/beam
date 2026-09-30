@@ -80,7 +80,6 @@ impl From<&State> for Report {
     }
 }
 
-/// Motor strengths (0-255) a game requested from a virtual controller.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rumble {
     pub index: u8,
@@ -88,7 +87,6 @@ pub struct Rumble {
     pub weak: u8,
 }
 
-/// Sums the playing effects, scales by the device gain and narrows to 8 bits.
 #[cfg(any(target_os = "linux", test))]
 fn combine(effects: impl Iterator<Item = (u16, u16)>, gain: u16) -> (u8, u8) {
     let (strong, weak) = effects.fold((0u64, 0u64), |(strong, weak), (s, w)| {
@@ -98,7 +96,6 @@ fn combine(effects: impl Iterator<Item = (u16, u16)>, gain: u16) -> (u8, u8) {
     (scale(strong), scale(weak))
 }
 
-/// Whether this host can create virtual controllers right now.
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Status {
@@ -126,14 +123,12 @@ pub fn health() -> Health {
     }
 }
 
-/// Opens the bundled driver installer; Windows asks the user for permission.
 pub fn install_driver() -> anyhow::Result<()> {
     let installer = platform::installer().context("this build doesn't include the driver installer")?;
     open::that(installer)?;
     Ok(())
 }
 
-/// Starts the bundled installer if the driver is missing. Called on first run.
 pub fn install_driver_if_missing() {
     if matches!(platform::probe(), Status::DriverMissing)
         && platform::installer().is_some()
@@ -143,7 +138,6 @@ pub fn install_driver_if_missing() {
     }
 }
 
-/// One virtual controller per browser gamepad.
 pub struct Gamepads {
     devices: HashMap<u8, platform::Device>,
     unavailable: bool,
@@ -219,7 +213,6 @@ mod platform {
         })
     }
 
-    /// Needs the ViGEmBus driver.
     pub struct Device(Xbox360Wired<Arc<Client>>);
 
     impl Device {
@@ -267,7 +260,6 @@ mod platform {
         time::{Duration, Instant},
     };
 
-    /// Needs write access to /dev/uinput.
     pub struct Device {
         device: Arc<Mutex<VirtualDevice>>,
         previous: Report,
@@ -409,7 +401,6 @@ mod platform {
     fn serve_force_feedback(device: Weak<Mutex<VirtualDevice>>, notify: impl Fn(u8, u8)) {
         // id -> (strong, weak, length in ms; 0 plays until stopped)
         let mut effects = HashMap::<i16, (u16, u16, u16)>::new();
-        // id -> when it ends by itself
         let mut playing = HashMap::<i16, Option<Instant>>::new();
         let mut gain = u16::MAX;
         let mut last = (0, 0);
@@ -483,7 +474,7 @@ mod platform {
     }
 }
 
-/// No supported way to create a virtual controller here (needs a signed driver extension).
+/// Virtual controllers need a signed driver extension here.
 #[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use super::{Report, Status};

@@ -20,7 +20,7 @@ base64 = "0.22"
 bytes = "1"
 dirs = "6"
 display-info = "0.5"
-enigo = { version = "0.2", features = ["wayland", "libei"] }
+enigo = { git = "https://github.com/enigo-rs/enigo", rev = "a88d9b7e2cec7043ab5f03e754500a091ea928d1", default-features = false, features = ["libei", "tokio"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 open = "5"
 opus = "0.4"
@@ -56,3 +56,8 @@ vigem-client = { version = "0.1", features = ["unstable_xtarget_notification"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = "0.0.2"
+
+[patch.crates-io]
+# VideoToolbox emits IDR_N_LP (NAL type 20), which the released payloader
+# incorrectly discarded.
+rtp = { path = "vendor/rtp" }

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use webrtc::{
     api::{
         APIBuilder,
@@ -28,7 +28,16 @@ pub struct Media {
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
     rumble_tx: tokio::sync::broadcast::Sender<crate::gamepad::Rumble>,
     settings: Arc<tokio::sync::RwLock<crate::capture::StreamSettings>>,
+    active_session: Arc<tokio::sync::Mutex<Option<ActiveSession>>>,
+    persistent_source: Arc<tokio::sync::Mutex<Option<Arc<capture::SourceSession>>>>,
+    persistent_sessions: bool,
     hardware_codecs: capture::HardwareCodecAvailability,
+    encode_duration_us: Arc<AtomicU64>,
+}
+
+struct ActiveSession {
+    peer: Arc<RTCPeerConnection>,
+    shutdown: oneshot::Sender<()>,
 }
 
 #[derive(Deserialize)]
@@ -53,10 +62,17 @@ struct StreamSettingsMessage {
     hardware_codecs: capture::HardwareCodecAvailability,
 }
 
+#[derive(Serialize)]
+struct StreamStatsMessage {
+    r#type: &'static str,
+    encode_ms: f64,
+}
+
 impl Media {
     pub fn new(
         input_tx: std::sync::mpsc::Sender<Vec<u8>>,
         rumble_tx: tokio::sync::broadcast::Sender<crate::gamepad::Rumble>,
+        persistent_sessions: bool,
     ) -> Result<Arc<Self>> {
         let mut engine = MediaEngine::default();
         let h264 = RTCRtpCodecCapability {
@@ -101,12 +117,23 @@ impl Media {
             input_tx,
             rumble_tx,
             settings: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            active_session: Arc::new(tokio::sync::Mutex::new(None)),
+            persistent_source: Arc::new(tokio::sync::Mutex::new(
+                persistent_sessions.then(|| capture::spawn_source(Default::default())),
+            )),
+            persistent_sessions,
             hardware_codecs: capture::ffmpeg::hardware_codecs(),
+            encode_duration_us: Arc::new(AtomicU64::new(0)),
         });
         Ok(media)
     }
 
     pub async fn answer(&self, sdp: String) -> Result<RTCSessionDescription> {
+        if let Some(active) = self.active_session.lock().await.take() {
+            let _ = active.shutdown.send(());
+            let peer = active.peer;
+            let _ = peer.close().await;
+        }
         let settings_snapshot = *self.settings.read().await;
         let capability = match settings_snapshot.codec {
             Codec::H264 => RTCRtpCodecCapability {
@@ -123,24 +150,41 @@ impl Media {
                 .new_peer_connection(RTCConfiguration::default())
                 .await?,
         );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        *self.active_session.lock().await = Some(ActiveSession {
+            peer: peer.clone(),
+            shutdown: shutdown_tx,
+        });
         let input_tx = self.input_tx.clone();
         let rumble_tx = self.rumble_tx.clone();
         let settings = self.settings.clone();
         let hardware_codecs = self.hardware_codecs;
+        let encode_duration_us = self.encode_duration_us.clone();
         peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let input_tx = input_tx.clone();
             let rumble_tx = rumble_tx.clone();
             let settings = settings.clone();
+            let encode_duration_us = encode_duration_us.clone();
             Box::pin(async move {
-                if channel.label() != "input" {
+                if channel.label() != "input" && channel.label() != "pointer" {
                     return;
                 }
-                tracing::info!("input data channel connected");
+                tracing::info!(label = channel.label(), "input data channel connected");
+                if channel.label() == "pointer" {
+                    channel.on_message(Box::new(move |message: DataChannelMessage| {
+                        let input_tx = input_tx.clone();
+                        Box::pin(async move {
+                            let _ = input_tx.send(message.data.to_vec());
+                        })
+                    }));
+                    return;
+                }
                 let open_channel = channel.clone();
                 let open_settings = settings.clone();
                 channel.on_open(Box::new(move || {
                     let channel = open_channel.clone();
                     let settings = open_settings.clone();
+                    let encode_duration_us = encode_duration_us.clone();
                     let rumble = rumble_tx.subscribe();
                     Box::pin(async move {
                         tokio::spawn(relay_rumble(channel.clone(), rumble));
@@ -154,6 +198,21 @@ impl Media {
                             hardware_codecs,
                         }).unwrap();
                         let _ = channel.send_text(message).await;
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+                                    break;
+                                }
+                                let stats = serde_json::to_string(&StreamStatsMessage {
+                                    r#type: "streamStats",
+                                    encode_ms: encode_duration_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                                }).unwrap();
+                                if channel.send_text(stats).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
                     })
                 }));
                 let message_channel = channel.clone();
@@ -232,8 +291,27 @@ impl Media {
             .local_description()
             .await
             .context("missing local description")?;
-        tokio::spawn(run_session(peer, track, audio_track, settings_snapshot));
+        tokio::spawn(run_session(
+            peer,
+            track,
+            audio_track,
+            settings_snapshot,
+            self.encode_duration_us.clone(),
+            shutdown_rx,
+            self.persistent_source.clone(),
+            self.persistent_sessions,
+        ));
         Ok(answer)
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(active) = self.active_session.lock().await.take() {
+            let _ = active.shutdown.send(());
+            let _ = active.peer.close().await;
+        }
+        if let Some(source) = self.persistent_source.lock().await.take() {
+            source.stop();
+        }
     }
 }
 
@@ -265,44 +343,89 @@ async fn run_session(
     track: Arc<TrackLocalStaticSample>,
     audio_track: Arc<TrackLocalStaticSample>,
     settings: crate::capture::StreamSettings,
+    encode_duration_us: Arc<AtomicU64>,
+    mut shutdown: oneshot::Receiver<()>,
+    persistent_source: Arc<tokio::sync::Mutex<Option<Arc<capture::SourceSession>>>>,
+    persistent_sessions: bool,
 ) {
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
-        while matches!(
-            peer.connection_state(),
-            RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting
-        ) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        loop {
+            if !matches!(
+                peer.connection_state(),
+                RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting
+            ) {
+                break true;
+            }
+            tokio::select! {
+                _ = &mut shutdown => break false,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
         }
     })
     .await
-    .is_ok()
+    .ok()
+        == Some(true)
         && peer.connection_state() == RTCPeerConnectionState::Connected;
     if !connected {
         let _ = peer.close().await;
         return;
     }
 
+    let source = if persistent_sessions {
+        let mut cached = persistent_source.lock().await;
+        if cached.as_ref().is_none_or(|source| source.is_closed()) {
+            *cached = Some(capture::spawn_source(settings));
+        }
+        cached.as_ref().unwrap().clone()
+    } else {
+        capture::spawn_source(settings)
+    };
     let (frames_tx, mut frames_rx) = mpsc::channel(1);
     let (audio_tx, mut audio_rx) = mpsc::channel(8);
-    let (audio, audio_frames_tx) = crate::audio::spawn(audio_tx);
-    let (capture, mut capture_errors) = capture::spawn(frames_tx, audio_frames_tx, settings);
+    let audio = crate::audio::spawn(source.subscribe_audio(), audio_tx);
+    let (encoder, mut encoder_errors) = capture::spawn_encoder(&source, frames_tx, settings);
+    let mut source_errors = source.subscribe_errors();
     loop {
         tokio::select! {
-            error = capture_errors.recv() => {
-                if let Some(error) = error {
+            _ = &mut shutdown => break,
+            error = source_errors.recv() => {
+                if let Ok(error) = error {
                     tracing::warn!(%error, "closing peer after capture failure");
+                }
+                if persistent_sessions {
+                    let mut cached = persistent_source.lock().await;
+                    if cached.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &source)) {
+                        cached.take();
+                    }
+                }
+                break;
+            }
+            error = encoder_errors.recv() => {
+                if let Some(error) = error {
+                    tracing::warn!(%error, "closing peer after encoder failure");
                 }
                 break;
             }
             frame = frames_rx.recv() => {
                 let Some(frame) = frame else { break };
-                if let Err(error) = track.write_sample(&Sample {
+                // Warmup packets right after a codec switch carry Duration::ZERO;
+                // keep the previous reading instead of reporting a bogus 0 ms.
+                if !frame.encode_duration.is_zero() {
+                    encode_duration_us.store(frame.encode_duration.as_micros() as u64, Ordering::Relaxed);
+                }
+                let sample = Sample {
                     data: frame.data.into(),
                     duration: frame.duration,
                     ..Default::default()
-                }).await {
-                    tracing::warn!(%error, "failed to send video frame");
-                    break;
+                };
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    result = track.write_sample(&sample) => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "failed to send video frame");
+                            break;
+                        }
+                    }
                 }
             }
             frame = audio_rx.recv() => {
@@ -323,7 +446,15 @@ async fn run_session(
             }
         }
     }
-    drop(capture);
-    drop(audio);
+    let _ = tokio::task::spawn_blocking(move || {
+        encoder.shutdown();
+        audio.shutdown();
+        if !persistent_sessions {
+            if let Ok(source) = Arc::try_unwrap(source) {
+                source.shutdown();
+            }
+        }
+    })
+    .await;
     let _ = peer.close().await;
 }

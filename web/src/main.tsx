@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import './index.css'
 
-type Settings = { password: string; address: string }
+type Settings = { password: string; address: string; persistent_sessions: boolean }
 type GamepadHealth = {
   state: 'ready' | 'driver_missing' | 'no_permission' | 'unsupported' | 'failed'
   message?: string
@@ -14,6 +14,7 @@ const LINUX_UINPUT_SETUP = `echo 'KERNEL=="uinput", MODE="0660", GROUP="input", 
 type Codec = 'h264' | 'h265' | 'av1'
 type HardwareCodecs = { h264: boolean; h265: boolean; av1: boolean }
 type StreamSettings = { codec: Codec; resolution: number; bitrate: number; host_cursor_visible: boolean }
+type LatencySample = { time: number; value: number }
 const ADMIN_TOKEN = 'beam_admin_token'
 const STREAM_SETTINGS = 'beam_stream_settings'
 
@@ -53,10 +54,6 @@ function Shell({ children }: { children: React.ReactNode }) {
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,#172235_0,#080b10_42%)] px-5 py-10">
       <div className="mx-auto max-w-5xl">
-        <header className="mb-10 flex items-center gap-3">
-          <div className="grid size-9 place-items-center rounded-xl bg-cyan-300 font-black text-slate-950">B</div>
-          <span className="text-lg font-semibold tracking-tight">Beam</span>
-        </header>
         {children}
       </div>
     </main>
@@ -68,14 +65,22 @@ function Viewer() {
   const player = useRef<HTMLElement>(null)
   const peer = useRef<RTCPeerConnection | null>(null)
   const connectionGeneration = useRef(0)
+  const latencyFrameCallback = useRef<number | undefined>(undefined)
   const inputChannel = useRef<RTCDataChannel | null>(null)
   const settingsReady = useRef(false)
   const reconnecting = useRef(false)
   const keyboardCleanup = useRef<(() => void) | null>(null)
   const rememberedSettings = useRef(loadStreamSettings())
   const hostSettings = useRef<StreamSettings | null>(null)
+  const latencySamples = useRef<Array<{ time: number; value: number }>>([])
+  const encodeLatencySamples = useRef<LatencySample[]>([])
+  const networkLatencySamples = useRef<LatencySample[]>([])
+  const encodeLatencyRef = useRef(0)
   const [password, setPassword] = useState('')
   const [status, setStatus] = useState('Ready')
+  const [latency, setLatency] = useState<number | null>(null)
+  const [encodeLatency, setEncodeLatency] = useState(0)
+  const [networkLatency, setNetworkLatency] = useState(0)
   const [fullscreen, setFullscreen] = useState(false)
   const [streamAspect, setStreamAspect] = useState(16 / 9)
   const [clientMouseVisible, setClientMouseVisible] = useState(true)
@@ -98,18 +103,28 @@ function Viewer() {
   }, [])
 
   async function toggleFullscreen() {
-    if (document.fullscreenElement) {
-      await document.exitFullscreen()
+    const fullscreenDocument = document as Document & {
+      webkitFullscreenElement?: Element
+      webkitExitFullscreen?: () => Promise<void> | void
+    }
+    const fullscreenElement = document.fullscreenElement ?? fullscreenDocument.webkitFullscreenElement
+    if (fullscreenElement) {
+      if (document.exitFullscreen) await document.exitFullscreen()
+      else await fullscreenDocument.webkitExitFullscreen?.()
       unlockKeyboard()
     } else {
       const element = player.current
       if (!element) return
+      const fullscreenElement = element as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void> | void
+      }
       try {
-        await (element.requestFullscreen as (options?: { keyboardLock?: 'browser' }) => Promise<void>)({
+        await (element.requestFullscreen as (options?: { keyboardLock?: 'browser' }) => Promise<void>)?.({
           keyboardLock: 'browser',
         })
       } catch {
-        await element.requestFullscreen()
+        if (element.requestFullscreen) await element.requestFullscreen()
+        else await fullscreenElement.webkitRequestFullscreen?.()
       }
       const keyboard = (navigator as Navigator & {
         keyboard?: { lock?: (keys?: string[]) => Promise<void> }
@@ -124,11 +139,43 @@ function Viewer() {
 
   useEffect(() => {
     const update = () => {
-      setFullscreen(document.fullscreenElement === player.current)
-      if (!document.fullscreenElement) unlockKeyboard()
+      const fullscreenDocument = document as Document & { webkitFullscreenElement?: Element }
+      const fullscreenElement = document.fullscreenElement ?? fullscreenDocument.webkitFullscreenElement
+      const playerIsFullscreen = fullscreenElement === player.current
+      setFullscreen(playerIsFullscreen)
+      if (!fullscreenElement) unlockKeyboard()
     }
     document.addEventListener('fullscreenchange', update)
-    return () => document.removeEventListener('fullscreenchange', update)
+    document.addEventListener('webkitfullscreenchange', update)
+    return () => {
+      document.removeEventListener('fullscreenchange', update)
+      document.removeEventListener('webkitfullscreenchange', update)
+    }
+  }, [])
+
+  /* Fix for dumbass Chrome MacOS bug where native green "Exit Fullscreen" button doesn't actually make the page exit fullscreen mode */
+  useEffect(() => {
+    let lastWidth = window.innerWidth
+    let lastHeight = window.innerHeight
+    let inFullscreen = !!document.fullscreenElement || document.fullscreen
+    let exitTimer: number | undefined
+    const fullscreenPoll = window.setInterval(() => {
+      const isFullscreen = !!document.fullscreenElement || document.fullscreen
+      if (inFullscreen && isFullscreen && (lastWidth !== window.innerWidth || lastHeight !== window.innerHeight)) {
+        exitTimer = window.setTimeout(() => {
+          void document.exitFullscreen()
+          void document.body.requestFullscreen()
+          void document.exitFullscreen()
+        }, 900)
+      }
+      lastWidth = window.innerWidth
+      lastHeight = window.innerHeight
+      inFullscreen = isFullscreen
+    }, 500)
+    return () => {
+      window.clearInterval(fullscreenPoll)
+      if (exitTimer !== undefined) window.clearTimeout(exitTimer)
+    }
   }, [])
 
   function unlockKeyboard() {
@@ -141,6 +188,15 @@ function Viewer() {
   async function connect(event?: React.FormEvent) {
     event?.preventDefault()
     const generation = ++connectionGeneration.current
+    if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
+    latencyFrameCallback.current = undefined
+    latencySamples.current = []
+    encodeLatencySamples.current = []
+    networkLatencySamples.current = []
+    encodeLatencyRef.current = 0
+    setLatency(null)
+    setEncodeLatency(0)
+    setNetworkLatency(0)
     setStatus('Authenticating…')
     try {
       await json('/api/session', { method: 'POST', body: JSON.stringify({ password }) })
@@ -152,6 +208,7 @@ function Viewer() {
       pc.addTransceiver('video', { direction: 'recvonly' })
       pc.addTransceiver('audio', { direction: 'recvonly' })
       const input = pc.createDataChannel('input')
+      const pointer = pc.createDataChannel('pointer', { ordered: false, maxRetransmits: 0 })
       inputChannel.current = input
       // Browser rumble effects are short, so active ones are replayed until stopped.
       const rumbles = new Map<number, { strong: number; weak: number }>()
@@ -168,16 +225,22 @@ function Viewer() {
       input.onmessage = event => {
         if (generation !== connectionGeneration.current) return
         try {
-          const message = JSON.parse(event.data) as {
-            type?: string; index?: number; strong?: number; weak?: number; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs
-          }
-          if (message.type === 'rumble' && message.index != null) {
-            if (message.strong || message.weak) rumbles.set(message.index, { strong: message.strong ?? 0, weak: message.weak ?? 0 })
-            else rumbles.delete(message.index)
-            playRumble(message.index)
-            return
-          }
-          if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
+            const message = JSON.parse(event.data) as {
+              type?: string; index?: number; strong?: number; weak?: number; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs; encode_ms?: number
+            }
+            if (message.type === 'rumble' && message.index != null) {
+              if (message.strong || message.weak) rumbles.set(message.index, { strong: message.strong ?? 0, weak: message.weak ?? 0 })
+              else rumbles.delete(message.index)
+              playRumble(message.index)
+              return
+            }
+            if (message.type === 'streamStats' && message.encode_ms != null) {
+              const average = recordLatencySample(encodeLatencySamples, message.encode_ms)
+              encodeLatencyRef.current = average
+              setEncodeLatency(average)
+              return
+            }
+            if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
           const changed = settingsReady.current && hostSettings.current != null && (
             hostSettings.current.codec !== message.codec ||
             hostSettings.current.resolution !== message.resolution ||
@@ -287,6 +350,22 @@ function Viewer() {
         }
         if (video.current) {
           video.current.srcObject = stream
+          const currentVideo = video.current
+          const recordLatency = (value: number) => {
+            setLatency(recordLatencySample(latencySamples, value))
+          }
+          const updateLatency = () => {
+            if (generation !== connectionGeneration.current) return
+            void measureFrameTimings(pc, encodeLatencyRef.current).then(timings => {
+              if (generation !== connectionGeneration.current) return
+              if (timings.age != null) recordLatency(timings.age)
+              if (timings.network != null)
+                setNetworkLatency(recordLatencySample(networkLatencySamples, timings.network))
+            })
+            latencyFrameCallback.current = currentVideo.requestVideoFrameCallback(updateLatency)
+          }
+          if ('requestVideoFrameCallback' in currentVideo)
+            latencyFrameCallback.current = currentVideo.requestVideoFrameCallback(updateLatency)
           video.current.onloadedmetadata = () => {
             if (video.current?.videoWidth && video.current.videoHeight)
               setStreamAspect(video.current.videoWidth / video.current.videoHeight)
@@ -295,14 +374,14 @@ function Viewer() {
             if (event.pointerType && event.pointerType !== 'mouse') return
             if (document.fullscreenElement !== player.current) return
             const position = streamPosition(video.current!, event.clientX, event.clientY)
-            if (position && input.readyState === 'open')
-              input.send(JSON.stringify({ type: 'mouseMove', ...position }))
+            if (position && pointer.readyState === 'open')
+              pointer.send(JSON.stringify({ type: 'mouseMove', ...position }))
           }
           video.current.onwheel = event => {
             if (document.fullscreenElement !== player.current) return
             event.preventDefault()
-            if (input.readyState === 'open')
-              input.send(JSON.stringify({
+            if (pointer.readyState === 'open')
+              pointer.send(JSON.stringify({
                 type: 'wheel', deltaX: event.deltaX, deltaY: event.deltaY, deltaMode: event.deltaMode,
               }))
           }
@@ -314,6 +393,17 @@ function Viewer() {
       pc.onconnectionstatechange = () => {
         if (generation !== connectionGeneration.current) return
         setStatus(pc.connectionState)
+        if (pc.connectionState !== 'connected') {
+          if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
+          latencyFrameCallback.current = undefined
+          latencySamples.current = []
+          encodeLatencySamples.current = []
+          networkLatencySamples.current = []
+          encodeLatencyRef.current = 0
+          setLatency(null)
+          setEncodeLatency(0)
+          setNetworkLatency(0)
+        }
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && video.current)
           video.current.srcObject = null
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
@@ -342,6 +432,7 @@ function Viewer() {
 
   useEffect(() => () => {
     connectionGeneration.current++
+    if (latencyFrameCallback.current !== undefined) video.current?.cancelVideoFrameCallback(latencyFrameCallback.current)
     keyboardCleanup.current?.()
     peer.current?.close()
   }, [])
@@ -429,7 +520,12 @@ function Viewer() {
           placeholder="Host password" className="min-w-0 flex-1 rounded-xl border border-white/10 bg-white/5 px-4 py-3 outline-none focus:border-cyan-300/60" />
         <button className="rounded-xl bg-cyan-300 px-6 py-3 font-semibold text-slate-950 hover:bg-cyan-200">Connect</button>
       </form>
-      <p className="mt-3 text-sm text-slate-400">{status}</p>
+      <p className="mt-3 text-sm text-slate-400">
+        {status}
+        {status === 'connected' && latency != null && <span className="ml-2 text-slate-500">
+          · {latency} ms ({encodeLatency} ms encode, {networkLatency} ms network)
+        </span>}
+      </p>
     </Shell>
   )
 }
@@ -463,7 +559,6 @@ function GamepadCard({ token }: { token: string }) {
       .then(value => { if (!stopped) setHealth(value) })
       .catch(() => {})
     void refresh()
-    // Keep checking until it works, so finishing the installer updates this by itself.
     const timer = ready ? undefined : window.setInterval(refresh, 2000)
     return () => {
       stopped = true
@@ -484,10 +579,11 @@ function GamepadCard({ token }: { token: string }) {
   if (!health) return null
   const notice = gamepadNotice(health)
   return (
-    <div className="mt-8 border-t border-white/10 pt-6">
-      <div className="flex items-center gap-2">
+    <section className="mt-8 border-t border-white/10 pt-6">
+      <h2 className="text-xl font-semibold tracking-tight">Gamepads</h2>
+      <div className="mt-3 flex items-center gap-2">
         <span className={`size-2.5 rounded-full ${notice.ok ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-        <h2 className="font-semibold">{notice.title}</h2>
+        <span className="font-medium">{notice.title}</span>
       </div>
       <p className="mt-2 text-sm leading-6 text-slate-400">
         {installing && !ready ? 'Finish the installer window that just opened. This updates by itself.' : notice.detail}
@@ -502,7 +598,7 @@ function GamepadCard({ token }: { token: string }) {
       )}
       {installing && !ready && <p className="mt-2 text-xs text-slate-500">Still nothing after it finishes? Restart your computer.</p>}
       {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
-    </div>
+    </section>
   )
 }
 
@@ -511,9 +607,12 @@ function SettingsPage() {
   const [authorized, setAuthorized] = useState<boolean | null>(null)
   const [password, setPassword] = useState('')
   const [address, setAddress] = useState('')
+  const [persistentSessions, setPersistentSessions] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const [restarting, setRestarting] = useState(false)
   const [status, setStatus] = useState('Loading…')
+  const [logs, setLogs] = useState('')
 
   useEffect(() => {
     history.replaceState(null, '', location.pathname + location.search)
@@ -526,7 +625,8 @@ function SettingsPage() {
         localStorage.setItem(ADMIN_TOKEN, token)
         setPassword(value.password)
         setAddress(value.address)
-        setStatus('Saved on this Mac')
+        setPersistentSessions(value.persistent_sessions)
+        setStatus('Saved.')
         setAuthorized(true)
         return json('/api/admin/settings-opened', {
           method: 'POST', headers: { authorization: `Bearer ${token}` },
@@ -542,6 +642,24 @@ function SettingsPage() {
       })
   }, [token])
 
+  useEffect(() => {
+    if (authorized !== true) return
+    let active = true
+    const refresh = () => {
+      void json<{ logs: string }>('/api/admin/logs', {
+        headers: { authorization: `Bearer ${token}` },
+      }).then(value => {
+        if (active) setLogs(value.logs)
+      }).catch(() => {})
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 2000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [authorized, token])
+
   async function save(event: React.FormEvent) {
     event.preventDefault()
     setStatus('Saving…')
@@ -549,7 +667,7 @@ function SettingsPage() {
       await json('/api/admin/settings', {
         method: 'PUT',
         headers: { authorization: `Bearer ${token}` },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ password, persistent_sessions: persistentSessions }),
       })
       setStatus('Saved')
     } catch (error) {
@@ -570,6 +688,19 @@ function SettingsPage() {
     }
   }
 
+  async function restart() {
+    if (!confirm('Restart Beam server?')) return
+    setRestarting(true)
+    try {
+      await json('/api/admin/restart', { method: 'POST', headers: { authorization: `Bearer ${token}` } })
+      setStatus('Restarting Beam…')
+      window.setTimeout(() => window.location.reload(), 1500)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not restart Beam')
+      setRestarting(false)
+    }
+  }
+
   if (authorized !== true) return (
     <Shell>
       <section className="max-w-xl rounded-3xl border border-white/10 bg-white/[.04] p-7 shadow-2xl">
@@ -587,11 +718,10 @@ function SettingsPage() {
     <Shell>
       <section className="max-w-xl rounded-3xl border border-white/10 bg-white/[.04] p-7 shadow-2xl">
         <p className="mb-2 text-xs font-semibold uppercase tracking-[.2em] text-cyan-300">Host settings</p>
-        <h1 className="text-3xl font-semibold tracking-tight">Who can connect?</h1>
         <p className="mt-4 rounded-xl bg-black/20 px-4 py-3 text-sm text-slate-300">
           Devices on your network can connect to this computer at <a className="font-mono text-cyan-300 hover:underline" href={address}>{address}</a>
         </p>
-        <form onSubmit={save} className="mt-8">
+        <form id="host-settings" onSubmit={save} className="mt-8">
           <label className="mb-2 block text-sm font-medium" htmlFor="password">Client password</label>
           <div className="relative">
             <input id="password" type={showPassword ? 'text' : 'password'} value={password}
@@ -605,17 +735,37 @@ function SettingsPage() {
               </svg>
             </button>
           </div>
-          <div className="mt-5 flex items-center gap-4">
-            <button className="rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Save password</button>
-            <span className="text-sm text-slate-400">{status}</span>
-          </div>
         </form>
         <GamepadCard token={token} />
+        <section className="mt-8 border-t border-white/10 pt-6">
+          <label className="mt-4 flex items-start gap-3 text-sm text-slate-300">
+            <input type="checkbox" checked={persistentSessions}
+              onChange={event => setPersistentSessions(event.target.checked)} className="mt-1 size-4" />
+            <span>
+              <span className="block font-medium text-white">Keep capture and input sessions persistent</span>
+              <span className="mt-1 block text-slate-400">Request capture and input permissions at startup and reuse the sessions across reconnects. Recommended on Linux which is more aggressive about asking for those permissions. May use more energy. Requires a restart.</span>
+            </span>
+          </label>
+        </section>
+        <section className="mt-8 border-t border-white/10 pt-6">
+          <h2 className="text-xl font-semibold tracking-tight">Application log</h2>
+          <pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-black/40 p-4 font-mono text-xs leading-5 text-slate-300">{logs || 'No log output yet.'}</pre>
+        </section>
+        <div className="mt-8 flex items-center gap-4 border-t border-white/10 pt-6">
+          <button type="submit" form="host-settings" className="rounded-xl bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 hover:bg-cyan-200">Save all settings</button>
+          <span className="text-sm text-slate-400">{status}</span>
+        </div>
         <div className="mt-8 border-t border-white/10 pt-6">
-          <button type="button" onClick={shutdown} disabled={stopping}
+          <div className="flex flex-wrap gap-3">
+          <button type="button" onClick={restart} disabled={stopping || restarting}
+            className="rounded-xl border border-amber-300/30 px-5 py-2.5 font-semibold text-amber-200 hover:bg-amber-300/10 disabled:opacity-50">
+            {restarting ? 'Restarting…' : 'Restart Beam server'}
+          </button>
+          <button type="button" onClick={shutdown} disabled={stopping || restarting}
             className="rounded-xl border border-red-400/30 px-5 py-2.5 font-semibold text-red-300 hover:bg-red-400/10 disabled:opacity-50">
             {stopping ? 'Stopping…' : 'Stop Beam server'}
           </button>
+          </div>
         </div>
       </section>
     </Shell>
@@ -633,6 +783,43 @@ function waitForIce(pc: RTCPeerConnection) {
     }
     pc.addEventListener('icegatheringstatechange', listener)
   })
+}
+
+function recordLatencySample(samples: { current: LatencySample[] }, value: number) {
+  const time = performance.now()
+  const recent = [...samples.current, { time, value: Math.max(0, value) }]
+    .filter(sample => sample.time >= time - 1000)
+  samples.current = recent
+  return Math.max(1, Math.round(recent.reduce((sum, sample) => sum + sample.value, 0) / recent.length))
+}
+
+async function measureFrameTimings(
+  pc: RTCPeerConnection,
+  encodeMs: number,
+) {
+  let roundTripTime: number | undefined
+  let jitterBufferDelay: number | undefined
+  let jitterBufferEmittedCount = 0
+  const stats = await pc.getStats()
+  stats.forEach(report => {
+    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime != null)
+      roundTripTime = report.currentRoundTripTime
+    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      if (report.jitterBufferDelay != null)
+        jitterBufferDelay = report.jitterBufferDelay
+      if (report.jitterBufferEmittedCount != null)
+        jitterBufferEmittedCount = report.jitterBufferEmittedCount
+    }
+  })
+  const jitterMs = jitterBufferDelay != null && jitterBufferEmittedCount > 0
+    ? jitterBufferDelay * 1000 / jitterBufferEmittedCount
+    : 0
+  const network = Math.max(0, (roundTripTime ?? 0) * 500 + jitterMs)
+  const age = Math.max(0, encodeMs + network)
+  return {
+    age,
+    network,
+  }
 }
 
 function streamPosition(video: HTMLVideoElement, clientX: number, clientY: number) {
