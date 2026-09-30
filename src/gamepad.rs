@@ -2,14 +2,13 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tokio::sync::broadcast;
 
-/// A browser gamepad snapshot using the W3C "standard" mapping.
+/// A browser gamepad snapshot (W3C standard mapping).
 #[derive(Deserialize)]
 pub struct State {
     pub buttons: Vec<f64>,
     pub axes: Vec<f64>,
 }
 
-/// Xbox 360 button bits, as used by XInput.
 mod button {
     pub const DPAD_UP: u16 = 0x0001;
     pub const DPAD_DOWN: u16 = 0x0002;
@@ -28,8 +27,7 @@ mod button {
     pub const Y: u16 = 0x8000;
 }
 
-/// Standard-mapping button index -> Xbox 360 button bit. Indices 6 and 7 are
-/// the analog triggers and are reported separately.
+/// Standard-mapping button index and its XInput bit. The triggers (6, 7) are analog.
 const BUTTONS: [(usize, u16); 15] = [
     (0, button::A),
     (1, button::B),
@@ -48,7 +46,7 @@ const BUTTONS: [(usize, u16); 15] = [
     (16, button::GUIDE),
 ];
 
-/// An Xbox 360 controller report. Stick Y axes are positive when pushed up.
+/// Xbox 360 controller state. Stick Y is positive when pushed up.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Report {
     pub buttons: u16,
@@ -81,8 +79,7 @@ impl From<&State> for Report {
     }
 }
 
-/// Force feedback a game asked a virtual controller to play, to be relayed to
-/// the browser gamepad with the same index. Motor strengths are 0-255.
+/// Motor strengths (0-255) a game requested from a virtual controller.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rumble {
     pub index: u8,
@@ -90,8 +87,7 @@ pub struct Rumble {
     pub weak: u8,
 }
 
-/// Adds up playing rumble effects (16-bit magnitudes) scaled by the device
-/// gain, giving 8-bit motor strengths.
+/// Sums the playing effects, scales by the device gain and narrows to 8 bits.
 #[cfg(any(target_os = "linux", test))]
 fn combine(effects: impl Iterator<Item = (u16, u16)>, gain: u16) -> (u8, u8) {
     let (strong, weak) = effects.fold((0u64, 0u64), |(strong, weak), (s, w)| {
@@ -101,7 +97,7 @@ fn combine(effects: impl Iterator<Item = (u16, u16)>, gain: u16) -> (u8, u8) {
     (scale(strong), scale(weak))
 }
 
-/// Virtual controllers on the host, one per connected browser gamepad.
+/// One virtual controller per browser gamepad.
 pub struct Gamepads {
     devices: HashMap<u8, platform::Device>,
     unavailable: bool,
@@ -121,7 +117,6 @@ impl Gamepads {
         if self.unavailable {
             return;
         }
-        // Browsers can expose only a handful of pads; ignore anything wilder.
         if index >= 4 {
             return;
         }
@@ -160,7 +155,7 @@ mod platform {
     use std::sync::Arc;
     use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
 
-    /// Requires the ViGEmBus driver: https://github.com/nefarius/ViGEmBus
+    /// Needs the ViGEmBus driver.
     pub struct Device(Xbox360Wired<Arc<Client>>);
 
     impl Device {
@@ -171,7 +166,6 @@ mod platform {
             let mut target = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
             target.plugin()?;
             target.wait_ready()?;
-            // The thread ends by itself when the target is dropped.
             target
                 .request_notification()?
                 .spawn_thread(move |_, rumble| notify(rumble.large_motor, rumble.small_motor));
@@ -209,7 +203,7 @@ mod platform {
         time::{Duration, Instant},
     };
 
-    /// Requires write access to /dev/uinput.
+    /// Needs write access to /dev/uinput.
     pub struct Device {
         device: Arc<Mutex<VirtualDevice>>,
         previous: Report,
@@ -248,7 +242,7 @@ mod platform {
             let keys = KEYS.iter().map(|(_, key)| *key).collect::<AttributeSet<_>>();
             let device = VirtualDevice::builder()?
                 .name("Beam Virtual Gamepad")
-                // Microsoft Xbox 360 controller, so SDL and games apply their usual mapping.
+                // Xbox 360 ids, so SDL and games pick the usual mapping.
                 .input_id(InputId::new(BusType::BUS_USB, 0x045e, 0x028e, 0x0110))
                 .with_keys(&keys)?
                 .with_absolute_axis(&stick(AbsoluteAxisCode::ABS_X))?
@@ -265,8 +259,7 @@ mod platform {
                 .map_err(|error| {
                     anyhow::anyhow!("could not create a uinput device; check /dev/uinput permissions ({error})")
                 })?;
-            // Games send rumble requests to the uinput fd itself, so watch it without
-            // blocking `send`, which shares the device.
+            // Rumble requests arrive on this same fd; don't let the reader block `send`.
             set_nonblocking(&device)?;
             let device = Arc::new(Mutex::new(device));
             let weak = Arc::downgrade(&device);
@@ -298,7 +291,7 @@ mod platform {
                 .filter_map(|(bit, code)| key(*bit, *code))
                 .chain([
                     axis(old.left_x != new.left_x, AbsoluteAxisCode::ABS_X, new.left_x.into()),
-                    // evdev's Y axes are positive downwards.
+                    // evdev Y is positive downwards.
                     axis(old.left_y != new.left_y, AbsoluteAxisCode::ABS_Y, -i32::from(new.left_y)),
                     axis(old.right_x != new.right_x, AbsoluteAxisCode::ABS_RX, new.right_x.into()),
                     axis(old.right_y != new.right_y, AbsoluteAxisCode::ABS_RY, -i32::from(new.right_y)),
@@ -318,7 +311,6 @@ mod platform {
                 .into_iter()
                 .flatten())
                 .collect::<Vec<_>>();
-            // `emit` appends the SYN_REPORT event itself.
             self.device.lock().unwrap().emit(&events)?;
             self.previous = new;
             Ok(())
@@ -327,7 +319,7 @@ mod platform {
 
     fn set_nonblocking(device: &VirtualDevice) -> std::io::Result<()> {
         let fd = device.as_raw_fd();
-        // SAFETY: `fd` is a valid open descriptor owned by `device`.
+        // SAFETY: `fd` is owned by `device` and open.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
@@ -337,11 +329,10 @@ mod platform {
         Ok(())
     }
 
-    /// Answers effect uploads and playback requests until the device is dropped.
     fn serve_force_feedback(device: Weak<Mutex<VirtualDevice>>, notify: impl Fn(u8, u8)) {
-        // Effect id -> (strong, weak, length in ms; 0 means until stopped).
+        // id -> (strong, weak, length in ms; 0 plays until stopped)
         let mut effects = HashMap::<i16, (u16, u16, u16)>::new();
-        // Effect id -> when it stops on its own.
+        // id -> when it ends by itself
         let mut playing = HashMap::<i16, Option<Instant>>::new();
         let mut gain = u16::MAX;
         let mut last = (0, 0);
@@ -415,8 +406,7 @@ mod platform {
     }
 }
 
-/// macOS has no supported way to create a virtual game controller without a
-/// signed driver extension, so gamepads are reported as unavailable there.
+/// No supported way to create a virtual controller here (needs a signed driver extension).
 #[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use super::Report;
@@ -472,7 +462,7 @@ mod tests {
     fn sticks_scale_clamp_and_flip_y() {
         let report = Report::from(&state(&[], [1.0, -1.0, -0.5, 2.0]));
         assert_eq!(report.left_x, i16::MAX);
-        assert_eq!(report.left_y, i16::MAX); // browser up (-1) is XInput up (+)
+        assert_eq!(report.left_y, i16::MAX);
         assert_eq!(report.right_x, -16383);
         assert_eq!(report.right_y, -i16::MAX);
     }

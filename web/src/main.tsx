@@ -133,8 +133,7 @@ function Viewer() {
       pc.addTransceiver('audio', { direction: 'recvonly' })
       const input = pc.createDataChannel('input')
       inputChannel.current = input
-      // Rumble requested by the host's games, keyed by gamepad index. Browser effects are
-      // short, so active ones are replayed until the host says to stop.
+      // Browser rumble effects are short, so active ones are replayed until stopped.
       const rumbles = new Map<number, { strong: number; weak: number }>()
       const playRumble = (index: number) => {
         const actuator = navigator.getGamepads()[index]?.vibrationActuator
@@ -220,7 +219,6 @@ function Viewer() {
       const keyUp = (event: KeyboardEvent) => sendKey('keyUp', event)
       window.addEventListener('keydown', keyDown, true)
       window.addEventListener('keyup', keyUp, true)
-      // Forward gamepads (standard mapping) whenever their state changes.
       const sent = new Map<number, string>()
       let gamepadFrame = 0
       const pollGamepads = () => {

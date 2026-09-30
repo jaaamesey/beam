@@ -237,7 +237,6 @@ impl Media {
     }
 }
 
-/// Forwards controller rumble from the host to the browser until the channel closes.
 async fn relay_rumble(
     channel: Arc<RTCDataChannel>,
     mut rumble: tokio::sync::broadcast::Receiver<crate::gamepad::Rumble>,
