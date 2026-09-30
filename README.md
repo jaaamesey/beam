@@ -6,4 +6,4 @@ Controllers connected to the browser (standard mapping, up to four) are forwarde
 
 - **Windows:** install the [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver.
 - **Linux:** the user running Beam needs write access to `/dev/uinput`.
-- **macOS:** not supported (virtual controllers need a signed driver extension).
+- **macOS:** for now, macOS hosts cannot receive gamepad input (virtual controllers need a signed driver extension). Mouse and keyboard still work.
