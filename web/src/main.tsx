@@ -201,9 +201,37 @@ function Viewer() {
       const keyUp = (event: KeyboardEvent) => sendKey('keyUp', event)
       window.addEventListener('keydown', keyDown, true)
       window.addEventListener('keyup', keyUp, true)
+      // Forward gamepads (standard mapping) whenever their state changes.
+      const sent = new Map<number, string>()
+      let gamepadFrame = 0
+      const pollGamepads = () => {
+        gamepadFrame = requestAnimationFrame(pollGamepads)
+        if (document.fullscreenElement !== player.current || input.readyState !== 'open') return
+        const connected = new Set<number>()
+        for (const pad of navigator.getGamepads()) {
+          if (!pad?.connected || pad.mapping !== 'standard' || pad.index > 3) continue
+          connected.add(pad.index)
+          const message = JSON.stringify({
+            type: 'gamepad',
+            index: pad.index,
+            buttons: pad.buttons.map(button => Math.round(button.value * 100) / 100),
+            axes: pad.axes.map(axis => Math.round(axis * 1000) / 1000),
+          })
+          if (sent.get(pad.index) === message) continue
+          sent.set(pad.index, message)
+          input.send(message)
+        }
+        for (const index of [...sent.keys()]) {
+          if (connected.has(index)) continue
+          sent.delete(index)
+          input.send(JSON.stringify({ type: 'gamepadDisconnected', index }))
+        }
+      }
+      gamepadFrame = requestAnimationFrame(pollGamepads)
       keyboardCleanup.current = () => {
         window.removeEventListener('keydown', keyDown, true)
         window.removeEventListener('keyup', keyUp, true)
+        cancelAnimationFrame(gamepadFrame)
       }
       pc.ontrack = ({ receiver, streams: [stream] }) => {
         const lowLatency = receiver as RTCRtpReceiver & {

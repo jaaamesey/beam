@@ -1,4 +1,5 @@
 use display_info::DisplayInfo;
+use crate::gamepad::{self, Gamepads};
 use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -43,13 +44,30 @@ enum Message {
     KeyUp { code: String, key: String },
     #[serde(rename = "mouseButton")]
     MouseButton { button: u16, down: bool },
+    #[serde(rename = "gamepad")]
+    Gamepad {
+        index: u8,
+        #[serde(flatten)]
+        state: gamepad::State,
+    },
+    #[serde(rename = "gamepadDisconnected")]
+    GamepadDisconnected { index: u8 },
 }
 
-pub fn new() -> anyhow::Result<Enigo> {
-    Ok(Enigo::new(&Settings::default())?)
+pub struct Input {
+    enigo: Enigo,
+    gamepads: Gamepads,
 }
 
-pub fn handle(enigo: &mut Enigo, message: &[u8]) {
+pub fn new() -> anyhow::Result<Input> {
+    Ok(Input {
+        enigo: Enigo::new(&Settings::default())?,
+        gamepads: Gamepads::default(),
+    })
+}
+
+pub fn handle(input: &mut Input, message: &[u8]) {
+    let Input { enigo, gamepads } = input;
     let Ok(message) = serde_json::from_slice::<Message>(message) else {
         return;
     };
@@ -63,6 +81,8 @@ pub fn handle(enigo: &mut Enigo, message: &[u8]) {
         Message::KeyDown { code, key } => key_event(enigo, &code, &key, Direction::Press),
         Message::KeyUp { code, key } => key_event(enigo, &code, &key, Direction::Release),
         Message::MouseButton { button, down } => mouse_button(enigo, button, down),
+        Message::Gamepad { index, state } => gamepads.update(index, &state),
+        Message::GamepadDisconnected { index } => gamepads.disconnect(index),
     }
 }
 

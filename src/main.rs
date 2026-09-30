@@ -5,6 +5,7 @@
 
 mod capture;
 mod config;
+mod gamepad;
 mod audio;
 mod input;
 mod rtc;

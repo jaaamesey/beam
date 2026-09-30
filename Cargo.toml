@@ -47,5 +47,11 @@ ffmpeg-next = { version = "9", default-features = false, features = [
     "static",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+vigem-client = "0.1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = "0.0.2"
