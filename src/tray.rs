@@ -25,6 +25,7 @@ pub fn run(
     settings_url: String,
     shutdown: Arc<AtomicBool>,
     input_rx: Receiver<Vec<u8>>,
+    rumble: tokio::sync::broadcast::Sender<crate::gamepad::Rumble>,
 ) -> Result<()> {
     let mut event_loop = EventLoop::new();
     #[cfg(target_os = "macos")]
@@ -50,7 +51,7 @@ pub fn run(
 
     let icon = icon()?;
     let mut tray = None;
-    let mut enigo = crate::input::new()?;
+    let mut enigo = crate::input::new(rumble)?;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2));
         for message in input_rx.try_iter() {

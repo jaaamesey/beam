@@ -3,6 +3,7 @@ use crate::gamepad::{self, Gamepads};
 use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
 use std::cell::RefCell;
+use tokio::sync::broadcast;
 
 thread_local! {
     static SCROLL_REMAINDER: RefCell<(f64, f64)> = const { RefCell::new((0.0, 0.0)) };
@@ -59,10 +60,10 @@ pub struct Input {
     gamepads: Gamepads,
 }
 
-pub fn new() -> anyhow::Result<Input> {
+pub fn new(rumble: broadcast::Sender<gamepad::Rumble>) -> anyhow::Result<Input> {
     Ok(Input {
         enigo: Enigo::new(&Settings::default())?,
-        gamepads: Gamepads::default(),
+        gamepads: Gamepads::new(rumble),
     })
 }
 

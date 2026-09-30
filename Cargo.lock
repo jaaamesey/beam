@@ -430,6 +430,7 @@ dependencies = [
  "evdev",
  "ffmpeg-next",
  "hyper-util",
+ "libc",
  "macos-accessibility-client",
  "open",
  "opus",

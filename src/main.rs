@@ -96,10 +96,11 @@ fn main() -> Result<()> {
     let settings_url = format!("https://127.0.0.1:{PORT}/settings#{}", config.admin_token);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let (rumble_tx, _) = tokio::sync::broadcast::channel(32);
     let app = Arc::new(App {
         config: RwLock::new(config),
         sessions: RwLock::new(HashMap::new()),
-        media: rtc::Media::new(input_tx)?,
+        media: rtc::Media::new(input_tx, rumble_tx.clone())?,
         shutdown: shutdown_flag.clone(),
         network_address,
     });
@@ -124,7 +125,7 @@ fn main() -> Result<()> {
     if open_settings && let Err(error) = open::that(&settings_url) {
         tracing::warn!(%error, "could not open settings in the browser");
     }
-    tray::run(settings_url, shutdown_flag, input_rx)
+    tray::run(settings_url, shutdown_flag, input_rx, rumble_tx)
 }
 
 fn resource_path(relative: &str) -> PathBuf {

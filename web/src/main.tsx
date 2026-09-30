@@ -133,11 +133,30 @@ function Viewer() {
       pc.addTransceiver('audio', { direction: 'recvonly' })
       const input = pc.createDataChannel('input')
       inputChannel.current = input
+      // Rumble requested by the host's games, keyed by gamepad index. Browser effects are
+      // short, so active ones are replayed until the host says to stop.
+      const rumbles = new Map<number, { strong: number; weak: number }>()
+      const playRumble = (index: number) => {
+        const actuator = navigator.getGamepads()[index]?.vibrationActuator
+        const rumble = rumbles.get(index)
+        if (!actuator) return
+        if (!rumble) void actuator.reset()
+        else void actuator.playEffect('dual-rumble', {
+          duration: 1000, startDelay: 0, strongMagnitude: rumble.strong / 255, weakMagnitude: rumble.weak / 255,
+        })
+      }
+      const rumbleTimer = window.setInterval(() => rumbles.forEach((_, index) => playRumble(index)), 800)
       input.onmessage = event => {
         if (generation !== connectionGeneration.current) return
         try {
           const message = JSON.parse(event.data) as {
-            type?: string; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs
+            type?: string; index?: number; strong?: number; weak?: number; codec?: Codec; resolution?: number; bitrate?: number; host_cursor_visible?: boolean; hardware_codecs?: HardwareCodecs
+          }
+          if (message.type === 'rumble' && message.index != null) {
+            if (message.strong || message.weak) rumbles.set(message.index, { strong: message.strong ?? 0, weak: message.weak ?? 0 })
+            else rumbles.delete(message.index)
+            playRumble(message.index)
+            return
           }
           if (message.type !== 'streamSettings' || message.codec == null || message.resolution == null || message.bitrate == null || message.host_cursor_visible == null) return
           const changed = settingsReady.current && hostSettings.current != null && (
@@ -232,6 +251,10 @@ function Viewer() {
         window.removeEventListener('keydown', keyDown, true)
         window.removeEventListener('keyup', keyUp, true)
         cancelAnimationFrame(gamepadFrame)
+        window.clearInterval(rumbleTimer)
+        const active = [...rumbles.keys()]
+        rumbles.clear()
+        active.forEach(playRumble)
       }
       pc.ontrack = ({ receiver, streams: [stream] }) => {
         const lowLatency = receiver as RTCRtpReceiver & {

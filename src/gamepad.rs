@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use tokio::sync::broadcast;
 
 /// A browser gamepad snapshot using the W3C "standard" mapping.
 #[derive(Deserialize)]
@@ -80,14 +81,42 @@ impl From<&State> for Report {
     }
 }
 
+/// Force feedback a game asked a virtual controller to play, to be relayed to
+/// the browser gamepad with the same index. Motor strengths are 0-255.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rumble {
+    pub index: u8,
+    pub strong: u8,
+    pub weak: u8,
+}
+
+/// Adds up playing rumble effects (16-bit magnitudes) scaled by the device
+/// gain, giving 8-bit motor strengths.
+#[cfg(any(target_os = "linux", test))]
+fn combine(effects: impl Iterator<Item = (u16, u16)>, gain: u16) -> (u8, u8) {
+    let (strong, weak) = effects.fold((0u64, 0u64), |(strong, weak), (s, w)| {
+        (strong + u64::from(s), weak + u64::from(w))
+    });
+    let scale = |total: u64| ((total * u64::from(gain) / u64::from(u16::MAX)).min(0xffff) >> 8) as u8;
+    (scale(strong), scale(weak))
+}
+
 /// Virtual controllers on the host, one per connected browser gamepad.
-#[derive(Default)]
 pub struct Gamepads {
     devices: HashMap<u8, platform::Device>,
     unavailable: bool,
+    rumble: broadcast::Sender<Rumble>,
 }
 
 impl Gamepads {
+    pub fn new(rumble: broadcast::Sender<Rumble>) -> Self {
+        Self {
+            devices: HashMap::new(),
+            unavailable: false,
+            rumble,
+        }
+    }
+
     pub fn update(&mut self, index: u8, state: &State) {
         if self.unavailable {
             return;
@@ -98,7 +127,11 @@ impl Gamepads {
         }
         let report = Report::from(state);
         if !self.devices.contains_key(&index) {
-            match platform::Device::new(index) {
+            let rumble = self.rumble.clone();
+            let notify = move |strong, weak| {
+                let _ = rumble.send(Rumble { index, strong, weak });
+            };
+            match platform::Device::new(notify) {
                 Ok(device) => {
                     self.devices.insert(index, device);
                 }
@@ -131,13 +164,17 @@ mod platform {
     pub struct Device(Xbox360Wired<Arc<Client>>);
 
     impl Device {
-        pub fn new(_index: u8) -> anyhow::Result<Self> {
+        pub fn new(notify: impl Fn(u8, u8) + Send + 'static) -> anyhow::Result<Self> {
             let client = Arc::new(Client::connect().map_err(|error| {
                 anyhow::anyhow!("ViGEmBus driver is not installed or not running ({error})")
             })?);
             let mut target = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
             target.plugin()?;
             target.wait_ready()?;
+            // The thread ends by itself when the target is dropped.
+            target
+                .request_notification()?
+                .spawn_thread(move |_, rumble| notify(rumble.large_motor, rumble.small_motor));
             Ok(Self(target))
         }
 
@@ -160,15 +197,25 @@ mod platform {
 mod platform {
     use super::{Report, button};
     use evdev::{
-        AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode,
-        UinputAbsSetup, uinput::VirtualDevice,
+        AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventSummary, EventType, FFEffectCode,
+        FFEffectKind, InputEvent, InputId, KeyCode, UInputCode, UinputAbsSetup,
+        uinput::VirtualDevice,
+    };
+    use std::{
+        collections::HashMap,
+        io::ErrorKind,
+        os::fd::AsRawFd,
+        sync::{Arc, Mutex, Weak},
+        time::{Duration, Instant},
     };
 
     /// Requires write access to /dev/uinput.
     pub struct Device {
-        device: VirtualDevice,
+        device: Arc<Mutex<VirtualDevice>>,
         previous: Report,
     }
+
+    const MAX_EFFECTS: i16 = 16;
 
     const KEYS: [(u16, KeyCode); 11] = [
         (button::A, KeyCode::BTN_SOUTH),
@@ -197,7 +244,7 @@ mod platform {
     }
 
     impl Device {
-        pub fn new(_index: u8) -> anyhow::Result<Self> {
+        pub fn new(notify: impl Fn(u8, u8) + Send + 'static) -> anyhow::Result<Self> {
             let keys = KEYS.iter().map(|(_, key)| *key).collect::<AttributeSet<_>>();
             let device = VirtualDevice::builder()?
                 .name("Beam Virtual Gamepad")
@@ -212,10 +259,18 @@ mod platform {
                 .with_absolute_axis(&trigger(AbsoluteAxisCode::ABS_RZ))?
                 .with_absolute_axis(&hat(AbsoluteAxisCode::ABS_HAT0X))?
                 .with_absolute_axis(&hat(AbsoluteAxisCode::ABS_HAT0Y))?
+                .with_ff(&AttributeSet::from_iter([FFEffectCode::FF_RUMBLE, FFEffectCode::FF_GAIN]))?
+                .with_ff_effects_max(MAX_EFFECTS as u32)
                 .build()
                 .map_err(|error| {
                     anyhow::anyhow!("could not create a uinput device; check /dev/uinput permissions ({error})")
                 })?;
+            // Games send rumble requests to the uinput fd itself, so watch it without
+            // blocking `send`, which shares the device.
+            set_nonblocking(&device)?;
+            let device = Arc::new(Mutex::new(device));
+            let weak = Arc::downgrade(&device);
+            std::thread::spawn(move || serve_force_feedback(weak, notify));
             Ok(Self {
                 device,
                 previous: Report::default(),
@@ -264,9 +319,98 @@ mod platform {
                 .flatten())
                 .collect::<Vec<_>>();
             // `emit` appends the SYN_REPORT event itself.
-            self.device.emit(&events)?;
+            self.device.lock().unwrap().emit(&events)?;
             self.previous = new;
             Ok(())
+        }
+    }
+
+    fn set_nonblocking(device: &VirtualDevice) -> std::io::Result<()> {
+        let fd = device.as_raw_fd();
+        // SAFETY: `fd` is a valid open descriptor owned by `device`.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Answers effect uploads and playback requests until the device is dropped.
+    fn serve_force_feedback(device: Weak<Mutex<VirtualDevice>>, notify: impl Fn(u8, u8)) {
+        // Effect id -> (strong, weak, length in ms; 0 means until stopped).
+        let mut effects = HashMap::<i16, (u16, u16, u16)>::new();
+        // Effect id -> when it stops on its own.
+        let mut playing = HashMap::<i16, Option<Instant>>::new();
+        let mut gain = u16::MAX;
+        let mut last = (0, 0);
+        loop {
+            std::thread::sleep(Duration::from_millis(8));
+            let Some(device) = device.upgrade() else { return };
+            let mut device = device.lock().unwrap();
+            let events = match device.fetch_events() {
+                Ok(events) => events.collect::<Vec<_>>(),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => Vec::new(),
+                Err(error) => {
+                    tracing::warn!(%error, "gamepad force feedback stopped");
+                    return;
+                }
+            };
+            for event in events {
+                match event.destructure() {
+                    EventSummary::UInput(event, UInputCode::UI_FF_UPLOAD, ..) => {
+                        let Ok(mut upload) = device.process_ff_upload(event) else { continue };
+                        let effect = upload.effect();
+                        let id = upload.effect_id();
+                        let known = effects.contains_key(&id);
+                        let free = (0..MAX_EFFECTS).find(|id| !effects.contains_key(id));
+                        match (effect.kind, if known && id >= 0 { Some(id) } else { free }) {
+                            (FFEffectKind::Rumble { strong_magnitude, weak_magnitude }, Some(id)) => {
+                                effects.insert(id, (strong_magnitude, weak_magnitude, effect.replay.length));
+                                upload.set_effect_id(id);
+                                upload.set_retval(0);
+                            }
+                            _ => upload.set_retval(-1),
+                        }
+                    }
+                    EventSummary::UInput(event, UInputCode::UI_FF_ERASE, ..) => {
+                        if let Ok(erase) = device.process_ff_erase(event) {
+                            let id = erase.effect_id() as i16;
+                            effects.remove(&id);
+                            playing.remove(&id);
+                        }
+                    }
+                    EventSummary::ForceFeedback(_, FFEffectCode::FF_GAIN, value) => {
+                        gain = value.clamp(0, i32::from(u16::MAX)) as u16;
+                    }
+                    EventSummary::ForceFeedback(_, code, value) => {
+                        let id = code.0 as i16;
+                        match effects.get(&id) {
+                            Some(&(.., length)) if value > 0 => {
+                                let stop = (length > 0)
+                                    .then(|| Instant::now() + Duration::from_millis(length.into()));
+                                playing.insert(id, stop);
+                            }
+                            _ => {
+                                playing.remove(&id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            drop(device);
+            let now = Instant::now();
+            playing.retain(|_, stop| stop.is_none_or(|stop| stop > now));
+            let current = super::combine(
+                playing.keys().filter_map(|id| effects.get(id)).map(|&(strong, weak, _)| (strong, weak)),
+                gain,
+            );
+            if current != last {
+                last = current;
+                notify(current.0, current.1);
+            }
         }
     }
 }
@@ -280,7 +424,7 @@ mod platform {
     pub struct Device;
 
     impl Device {
-        pub fn new(_index: u8) -> anyhow::Result<Self> {
+        pub fn new(_notify: impl Fn(u8, u8) + Send + 'static) -> anyhow::Result<Self> {
             anyhow::bail!("virtual gamepads are not supported on this platform")
         }
 
@@ -331,6 +475,15 @@ mod tests {
         assert_eq!(report.left_y, i16::MAX); // browser up (-1) is XInput up (+)
         assert_eq!(report.right_x, -16383);
         assert_eq!(report.right_y, -i16::MAX);
+    }
+
+    #[test]
+    fn rumble_effects_add_up_scaled_by_gain() {
+        assert_eq!(combine([].into_iter(), u16::MAX), (0, 0));
+        assert_eq!(combine([(0xffff, 0x8000)].into_iter(), u16::MAX), (255, 128));
+        assert_eq!(combine([(0x4000, 0), (0x4000, 0)].into_iter(), u16::MAX), (128, 0));
+        assert_eq!(combine([(0xffff, 0xffff), (0xffff, 0)].into_iter(), u16::MAX), (255, 255));
+        assert_eq!(combine([(0xffff, 0xffff)].into_iter(), 0x8000), (128, 128));
     }
 
     #[test]
