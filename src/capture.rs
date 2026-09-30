@@ -28,7 +28,7 @@ pub struct HardwareCodecAvailability {
 }
 
 pub const CODEC: Codec = Codec::H264;
-pub const FPS: u32 = 30;
+pub const FPS: u32 = 60;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
