@@ -1,8 +1,8 @@
-# Third-party notices
+Third-party notices
 
-## ViGEmBus
+ViGEmBus - https://github.com/nefarius/ViGEmBus
 
-Windows builds include the installer for [ViGEmBus](https://github.com/nefarius/ViGEmBus) (in the `drivers` folder). It is a separate program that Beam only launches when you ask for gamepad support.
+Windows builds of Beam include the ViGEmBus installer. It is a separate program that Beam only launches when you ask for gamepad support.
 
 BSD 3-Clause License
 

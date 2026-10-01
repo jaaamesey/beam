@@ -1,5 +1,6 @@
 /target
 /web/dist
+/drivers/
 /web/node_modules
 *.log
 .pnpm-store/

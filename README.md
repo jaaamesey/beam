@@ -8,8 +8,10 @@ Controllers connected to the browser (standard mapping, up to four) are forwarde
 
 Beam's settings page (tray menu, "Open Beam Settings") shows whether gamepads are ready on the host and walks you through any one-time setup. It updates by itself once you're done.
 
-- **Windows:** needs the [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver. Release builds ship its installer next to `beam.exe` and start it on first run; if you skipped it, click "Install driver" in settings.
+- **Windows:** needs the [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver. Release builds include its installer inside `beam.exe` and start it on first run; if you skipped it, click "Install driver" in settings.
 - **Linux:** the user running Beam needs write access to `/dev/uinput`. Settings shows the command to run.
 - **macOS:** for now, macOS hosts cannot receive gamepad input (virtual controllers need an Apple-restricted entitlement). Mouse and keyboard still work.
 
-ViGEmBus is BSD-3-Clause licensed; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+ViGEmBus is BSD-3-Clause licensed; see [web/public/third-party-notices.txt](web/public/third-party-notices.txt) (also linked from the settings page).
+
+To build the Windows installer into `beam.exe` yourself, put it at `drivers/vigembus.exe` before `cargo build`; without it the build still works and settings links to the download.
