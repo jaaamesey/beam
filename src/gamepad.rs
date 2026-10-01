@@ -193,6 +193,14 @@ impl Gamepads {
     pub fn disconnect(&mut self, index: u8) {
         self.devices.remove(&index);
     }
+
+    pub fn release_all(&mut self) {
+        for device in self.devices.values_mut() {
+            if let Err(error) = device.send(&Report::default()) {
+                tracing::warn!(%error, "could not reset gamepad state");
+            }
+        }
+    }
 }
 
 #[cfg(windows)]

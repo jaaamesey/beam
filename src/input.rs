@@ -1,4 +1,4 @@
-use crate::gamepad::{self, Gamepads};
+use crate::{gamepad::{self, Gamepads}, held::Held};
 use display_info::DisplayInfo;
 use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
@@ -58,6 +58,7 @@ fn run(
     rumble: broadcast::Sender<gamepad::Rumble>,
 ) {
     let mut gamepads = Gamepads::new(rumble);
+    let mut held = Held::default();
     while !shutdown.load(Ordering::Relaxed) {
         let first = match receiver.recv_timeout(Duration::from_millis(2)) {
             Ok(message) => message,
@@ -65,7 +66,7 @@ fn run(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         process_batch(std::iter::once(first).chain(receiver.try_iter()), |message| {
-            handle_with_session(&mut enigo, &mut gamepads, &message);
+            handle_with_session(&mut enigo, &mut gamepads, &mut held, &message);
         });
     }
 }
@@ -90,16 +91,27 @@ fn process_batch(
     }
 }
 
-fn handle_with_session(enigo: &mut Option<Enigo>, gamepads: &mut Gamepads, message: &[u8]) {
+fn handle_with_session(
+    enigo: &mut Option<Enigo>,
+    gamepads: &mut Gamepads,
+    held: &mut Held,
+    message: &[u8],
+) {
     match serde_json::from_slice::<Message>(message) {
         Ok(Message::Gamepad { index, state }) => gamepads.update(index, &state),
         Ok(Message::GamepadDisconnected { index }) => gamepads.disconnect(index),
+        Ok(Message::ReleaseAll) => {
+            gamepads.release_all();
+            if let Some(enigo) = enigo.as_mut() {
+                release_held(enigo, held);
+            }
+        }
         Ok(message) => {
             if enigo.is_none() {
                 *enigo = new().map_err(|error| tracing::error!(%error, "could not initialise native input")).ok();
             }
             if let Some(enigo) = enigo.as_mut() {
-                handle(enigo, message);
+                handle(enigo, held, message);
             }
         }
         Err(_) => {}
@@ -134,6 +146,8 @@ pub(crate) enum Message {
     },
     #[serde(rename = "gamepadDisconnected")]
     GamepadDisconnected { index: u8 },
+    #[serde(rename = "releaseAll")]
+    ReleaseAll,
 }
 
 pub fn is_mouse_move(message: &[u8]) -> bool {
@@ -144,7 +158,17 @@ pub fn new() -> anyhow::Result<Enigo> {
     Ok(Enigo::new(&Settings::default())?)
 }
 
-fn handle(enigo: &mut Enigo, message: Message) {
+fn release_held(enigo: &mut Enigo, held: &mut Held) {
+    let (keys, buttons) = held.take();
+    for (code, key) in keys {
+        key_event(enigo, &code, &key, Direction::Release);
+    }
+    for button in buttons {
+        mouse_button(enigo, button, false);
+    }
+}
+
+fn handle(enigo: &mut Enigo, held: &mut Held, message: Message) {
     match message {
         Message::MouseMove { x, y } => move_mouse(enigo, x, y),
         Message::Wheel {
@@ -152,10 +176,19 @@ fn handle(enigo: &mut Enigo, message: Message) {
             delta_y,
             delta_mode,
         } => scroll(enigo, delta_x, delta_y, delta_mode),
-        Message::KeyDown { code, key } => key_event(enigo, &code, &key, Direction::Press),
-        Message::KeyUp { code, key } => key_event(enigo, &code, &key, Direction::Release),
-        Message::MouseButton { button, down } => mouse_button(enigo, button, down),
-        Message::Gamepad { .. } | Message::GamepadDisconnected { .. } => {}
+        Message::KeyDown { code, key } => {
+            let key = held.press_key(&code, &key);
+            key_event(enigo, &code, &key, Direction::Press);
+        }
+        Message::KeyUp { code, key } => {
+            let key = held.release_key(&code).unwrap_or(key);
+            key_event(enigo, &code, &key, Direction::Release);
+        }
+        Message::MouseButton { button, down } => {
+            held.button(button, down);
+            mouse_button(enigo, button, down);
+        }
+        Message::Gamepad { .. } | Message::GamepadDisconnected { .. } | Message::ReleaseAll => {}
     }
 }
 
