@@ -1,7 +1,13 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tokio::sync::broadcast;
+
+/// How long to wait before trying to create a virtual controller again, e.g. while the driver is being installed.
+const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A browser gamepad snapshot (W3C standard mapping).
 #[derive(Deserialize)]
@@ -140,7 +146,7 @@ pub fn install_driver_if_missing() {
 
 pub struct Gamepads {
     devices: HashMap<u8, platform::Device>,
-    unavailable: bool,
+    retry_after: Option<Instant>,
     rumble: broadcast::Sender<Rumble>,
 }
 
@@ -148,31 +154,34 @@ impl Gamepads {
     pub fn new(rumble: broadcast::Sender<Rumble>) -> Self {
         Self {
             devices: HashMap::new(),
-            unavailable: false,
+            retry_after: None,
             rumble,
         }
     }
 
     pub fn update(&mut self, index: u8, state: &State) {
-        if self.unavailable {
-            return;
-        }
         if index >= 4 {
             return;
         }
         let report = Report::from(state);
         if !self.devices.contains_key(&index) {
+            if self.retry_after.is_some_and(|time| Instant::now() < time) {
+                return;
+            }
             let rumble = self.rumble.clone();
             let notify = move |strong, weak| {
                 let _ = rumble.send(Rumble { index, strong, weak });
             };
             match platform::Device::new(notify) {
                 Ok(device) => {
+                    self.retry_after = None;
                     self.devices.insert(index, device);
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "gamepad input is unavailable on this host");
-                    self.unavailable = true;
+                    if self.retry_after.is_none() {
+                        tracing::warn!(%error, "gamepad input is unavailable on this host");
+                    }
+                    self.retry_after = Some(Instant::now() + RETRY_INTERVAL);
                     return;
                 }
             }
