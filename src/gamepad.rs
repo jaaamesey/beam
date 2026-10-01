@@ -1,4 +1,3 @@
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -125,19 +124,17 @@ pub fn health() -> Health {
     Health {
         status: platform::probe(),
         platform: std::env::consts::OS,
-        installer_available: platform::installer().is_some(),
+        installer_available: platform::installer_available(),
     }
 }
 
 pub fn install_driver() -> anyhow::Result<()> {
-    let installer = platform::installer().context("this build doesn't include the driver installer")?;
-    open::that(installer)?;
-    Ok(())
+    platform::install()
 }
 
 pub fn install_driver_if_missing() {
     if matches!(platform::probe(), Status::DriverMissing)
-        && platform::installer().is_some()
+        && platform::installer_available()
         && let Err(error) = install_driver()
     {
         tracing::warn!(%error, "could not start the gamepad driver installer");
@@ -202,8 +199,12 @@ impl Gamepads {
 mod platform {
     use super::Report;
     use super::Status;
-    use std::{path::PathBuf, sync::Arc};
+    use anyhow::Context;
+    use std::sync::Arc;
     use vigem_client::{Client, Error, TargetId, XButtons, XGamepad, Xbox360Wired};
+
+    // Empty unless build.rs found drivers/vigembus.exe.
+    const INSTALLER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vigembus.exe"));
 
     pub fn probe() -> Status {
         match Client::connect() {
@@ -213,13 +214,18 @@ mod platform {
         }
     }
 
-    /// The ViGEmBus installer shipped in a `drivers` folder next to beam.exe.
-    pub fn installer() -> Option<PathBuf> {
-        let folder = std::env::current_exe().ok()?.parent()?.join("drivers");
-        std::fs::read_dir(folder).ok()?.filter_map(Result::ok).map(|entry| entry.path()).find(|path| {
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_ascii_lowercase();
-            name.starts_with("vigembus") && (name.ends_with(".msi") || name.ends_with(".exe"))
-        })
+    pub fn installer_available() -> bool {
+        !INSTALLER.is_empty()
+    }
+
+    pub fn install() -> anyhow::Result<()> {
+        anyhow::ensure!(installer_available(), "this build doesn't include the driver installer");
+        let folder = dirs::data_local_dir().context("no local data directory")?.join("beam");
+        std::fs::create_dir_all(&folder)?;
+        let path = folder.join("ViGEmBus-setup.exe");
+        std::fs::write(&path, INSTALLER)?;
+        open::that(path)?;
+        Ok(())
     }
 
     pub struct Device(Xbox360Wired<Arc<Client>>);
@@ -286,8 +292,12 @@ mod platform {
         }
     }
 
-    pub fn installer() -> Option<std::path::PathBuf> {
-        None
+    pub fn installer_available() -> bool {
+        false
+    }
+
+    pub fn install() -> anyhow::Result<()> {
+        anyhow::bail!("this build doesn't include the driver installer")
     }
 
     const KEYS: [(u16, KeyCode); 11] = [
@@ -488,8 +498,12 @@ mod platform {
         Status::Unsupported
     }
 
-    pub fn installer() -> Option<std::path::PathBuf> {
-        None
+    pub fn installer_available() -> bool {
+        false
+    }
+
+    pub fn install() -> anyhow::Result<()> {
+        anyhow::bail!("this build doesn't include the driver installer")
     }
 
     pub struct Device;

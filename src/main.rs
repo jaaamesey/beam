@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 
+mod assets;
 mod capture;
 mod config;
 mod gamepad;
@@ -38,7 +39,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
-    path::PathBuf,
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -48,10 +48,7 @@ use tokio::{
     sync::RwLock,
 };
 use tokio_rustls::TlsAcceptor;
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::fmt::MakeWriter;
 
 const PORT: u16 = 9470;
@@ -186,7 +183,6 @@ fn main() -> Result<()> {
         logs,
     });
 
-    let web_root = resource_path("web/dist");
     let secure = Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", post(login))
@@ -199,9 +195,7 @@ fn main() -> Result<()> {
         .route("/api/admin/gamepad/install", post(install_gamepad_driver))
         .route("/api/admin/shutdown", post(shutdown))
         .route("/api/admin/restart", post(restart))
-        .fallback_service(
-            ServeDir::new(&web_root).not_found_service(ServeFile::new(web_root.join("index.html"))),
-        )
+        .fallback(get(assets::serve))
         .layer(TraceLayer::new_for_http())
         .with_state(app.clone());
     let welcome_router = if open_settings {
@@ -213,16 +207,16 @@ fn main() -> Result<()> {
             .route("/api/admin/gamepad/install", post(install_gamepad_driver))
             .route("/api/admin/shutdown", post(shutdown))
             .route("/api/admin/restart", post(restart))
-            .fallback_service(
-                ServeDir::new(&web_root)
-                    .not_found_service(ServeFile::new(web_root.join("index.html"))),
-            )
+            .fallback(get(assets::serve))
             .with_state(app.clone())
     } else {
         Router::new().fallback(welcome).with_state(app.clone())
     };
     let tls = tls::acceptor()?;
     runtime.spawn(run_server(listener, tls, secure, welcome_router));
+    if !assets::available() {
+        tracing::warn!("the web UI is not built in; run `pnpm --dir web build` and rebuild Beam");
+    }
     tracing::info!(address = %bound_address, "Beam is ready");
     if open_settings {
         gamepad::install_driver_if_missing();
@@ -288,19 +282,6 @@ fn replace_command(mut command: Command) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("restart Beam server: {error}"))?;
         Ok(())
     }
-}
-
-fn resource_path(relative: &str) -> PathBuf {
-    let development = PathBuf::from(relative);
-    if development.exists() {
-        return development;
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from))
-        .and_then(|macos| macos.parent().map(PathBuf::from))
-        .map(|contents| contents.join("Resources").join(relative))
-        .unwrap_or_else(|| PathBuf::from(relative))
 }
 
 async fn run_server(listener: TcpListener, tls: TlsAcceptor, secure: Router, welcome: Router) {

@@ -599,6 +599,8 @@ function GamepadCard({ token }: { token: string }) {
       )}
       {installing && !ready && <p className="mt-2 text-xs text-slate-500">Still nothing after it finishes? Restart your computer.</p>}
       {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
+      {health.platform === 'windows' && <a href="/third-party-notices.txt" target="_blank" rel="noreferrer"
+        className="mt-4 inline-block text-xs text-slate-500 hover:text-slate-300">Uses ViGEmBus (BSD-3-Clause) · licence</a>}
     </section>
   )
 }
