@@ -552,6 +552,7 @@ function GamepadCard({ token }: { token: string }) {
   const [installing, setInstalling] = useState(false)
   const [error, setError] = useState('')
   const ready = health?.state === 'ready'
+  const settled = ready || health?.state === 'unsupported'
 
   useEffect(() => {
     let stopped = false
@@ -559,12 +560,12 @@ function GamepadCard({ token }: { token: string }) {
       .then(value => { if (!stopped) setHealth(value) })
       .catch(() => {})
     void refresh()
-    const timer = ready ? undefined : window.setInterval(refresh, 2000)
+    const timer = settled ? undefined : window.setInterval(refresh, 2000)
     return () => {
       stopped = true
       window.clearInterval(timer)
     }
-  }, [token, ready])
+  }, [token, settled])
 
   async function install() {
     setError('')

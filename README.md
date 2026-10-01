@@ -1,4 +1,4 @@
-A simple desktop/game streaming tool. Currently experimental - has only been confirmed to work on MacOS, with only mouse (position-based) & keyboard support.
+A simple desktop/game streaming tool. Currently experimental - has only been confirmed to work on MacOS. Supports mouse (position-based) and keyboard, plus gamepads on Windows and Linux hosts (new, not yet confirmed on real hardware; see below).
 
 Currently only supports one client per stream (if that matters).
 
