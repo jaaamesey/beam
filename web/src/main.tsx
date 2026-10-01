@@ -285,13 +285,26 @@ function Viewer() {
           ...settings,
         }))
       }
-      const sendMouseButton = (event: PointerEvent, down: boolean) => {
+      // A second button pressed or released mid-press only shows up in `buttons` (on pointermove), so diff the mask.
+      let pressedButtons = 0
+      const syncMouseButtons = (event: PointerEvent) => {
         if (event.pointerType !== 'mouse' || input.readyState !== 'open') return
+        if (document.fullscreenElement !== player.current) return
+        for (const [bit, button] of [[1, 0], [4, 1], [2, 2]]) {
+          const down = (event.buttons & bit) !== 0
+          if (down !== ((pressedButtons & bit) !== 0))
+            input.send(JSON.stringify({ type: 'mouseButton', button, down }))
+        }
+        pressedButtons = event.buttons & 7
+      }
+      const mouseDown = (event: PointerEvent) => {
+        if (event.pointerType !== 'mouse') return
         video.current?.focus()
         if (document.fullscreenElement !== player.current) return
         event.preventDefault()
-        if ([0, 1, 2].includes(event.button))
-          input.send(JSON.stringify({ type: 'mouseButton', button: event.button, down }))
+        // Keep receiving moves and the release even if the pointer leaves the video.
+        video.current?.setPointerCapture(event.pointerId)
+        syncMouseButtons(event)
       }
       const sendKey = (type: 'keyDown' | 'keyUp', event: KeyboardEvent) => {
         if (document.fullscreenElement !== player.current || event.isComposing || input.readyState !== 'open') return
@@ -303,6 +316,17 @@ function Viewer() {
       window.addEventListener('keydown', keyDown, true)
       window.addEventListener('keyup', keyUp, true)
       const sent = new Map<number, string>()
+      const releaseAll = () => {
+        sent.clear()
+        pressedButtons = 0
+        if (input.readyState === 'open') input.send(JSON.stringify({ type: 'releaseAll' }))
+      }
+      const leaveFullscreen = () => {
+        if (document.fullscreenElement !== player.current) releaseAll()
+      }
+      window.addEventListener('blur', releaseAll)
+      document.addEventListener('fullscreenchange', leaveFullscreen)
+      document.addEventListener('webkitfullscreenchange', leaveFullscreen)
       let gamepadFrame = 0
       const pollGamepads = () => {
         gamepadFrame = requestAnimationFrame(pollGamepads)
@@ -331,6 +355,9 @@ function Viewer() {
       keyboardCleanup.current = () => {
         window.removeEventListener('keydown', keyDown, true)
         window.removeEventListener('keyup', keyUp, true)
+        window.removeEventListener('blur', releaseAll)
+        document.removeEventListener('fullscreenchange', leaveFullscreen)
+        document.removeEventListener('webkitfullscreenchange', leaveFullscreen)
         cancelAnimationFrame(gamepadFrame)
         window.clearInterval(rumbleTimer)
         const active = [...rumbles.keys()]
@@ -373,6 +400,7 @@ function Viewer() {
           video.current.onpointermove = event => {
             if (event.pointerType && event.pointerType !== 'mouse') return
             if (document.fullscreenElement !== player.current) return
+            syncMouseButtons(event)
             const position = streamPosition(video.current!, event.clientX, event.clientY)
             if (position && pointer.readyState === 'open')
               pointer.send(JSON.stringify({ type: 'mouseMove', ...position }))
@@ -385,8 +413,8 @@ function Viewer() {
                 type: 'wheel', deltaX: event.deltaX, deltaY: event.deltaY, deltaMode: event.deltaMode,
               }))
           }
-          video.current.onpointerdown = event => sendMouseButton(event, true)
-          video.current.onpointerup = event => sendMouseButton(event, false)
+          video.current.onpointerdown = mouseDown
+          video.current.onpointerup = syncMouseButtons
           video.current.oncontextmenu = event => event.preventDefault()
         }
       }

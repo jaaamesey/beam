@@ -179,6 +179,11 @@ impl Media {
                     }));
                     return;
                 }
+                let close_tx = input_tx.clone();
+                channel.on_close(Box::new(move || {
+                    let _ = close_tx.send(br#"{"type":"releaseAll"}"#.to_vec());
+                    Box::pin(async {})
+                }));
                 let open_channel = channel.clone();
                 let open_settings = settings.clone();
                 channel.on_open(Box::new(move || {

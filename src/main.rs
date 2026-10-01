@@ -7,6 +7,7 @@ mod assets;
 mod capture;
 mod config;
 mod gamepad;
+mod held;
 mod audio;
 mod input;
 mod rtc;
