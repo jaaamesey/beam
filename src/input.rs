@@ -11,6 +11,7 @@ use tokio::sync::broadcast;
 
 thread_local! {
     static SCROLL_REMAINDER: RefCell<(f64, f64)> = const { RefCell::new((0.0, 0.0)) };
+    static MOVE_REMAINDER: RefCell<(f64, f64)> = const { RefCell::new((0.0, 0.0)) };
 }
 
 #[derive(Clone, Copy)]
@@ -123,6 +124,8 @@ fn handle_with_session(
 pub(crate) enum Message {
     #[serde(rename = "mouseMove")]
     MouseMove { x: f64, y: f64 },
+    #[serde(rename = "mouseMoveRelative")]
+    MouseMoveRelative { dx: f64, dy: f64 },
     #[serde(rename = "wheel")]
     Wheel {
         #[serde(rename = "deltaX")]
@@ -171,6 +174,7 @@ fn release_held(enigo: &mut Enigo, held: &mut Held) {
 fn handle(enigo: &mut Enigo, held: &mut Held, message: Message) {
     match message {
         Message::MouseMove { x, y } => move_mouse(enigo, x, y),
+        Message::MouseMoveRelative { dx, dy } => move_mouse_relative(enigo, dx, dy),
         Message::Wheel {
             delta_x,
             delta_y,
@@ -312,16 +316,8 @@ fn scroll(enigo: &mut Enigo, delta_x: f64, delta_y: f64, delta_mode: u32) {
         2 => 24.0,
         _ => return,
     };
-    let (horizontal, vertical) = SCROLL_REMAINDER.with(|remainder| {
-        let mut remainder = remainder.borrow_mut();
-        remainder.0 += delta_x * scale;
-        remainder.1 += delta_y * scale;
-        let horizontal = remainder.0 as i32;
-        let vertical = remainder.1 as i32;
-        remainder.0 -= horizontal as f64;
-        remainder.1 -= vertical as f64;
-        (horizontal, vertical)
-    });
+    let (horizontal, vertical) = SCROLL_REMAINDER
+        .with(|remainder| whole_steps(&mut remainder.borrow_mut(), delta_x * scale, delta_y * scale));
     if horizontal != 0
         && let Err(error) = enigo.scroll(horizontal, enigo::Axis::Horizontal)
     {
@@ -334,9 +330,51 @@ fn scroll(enigo: &mut Enigo, delta_x: f64, delta_y: f64, delta_mode: u32) {
     }
 }
 
+fn move_mouse_relative(enigo: &mut Enigo, dx: f64, dy: f64) {
+    if !dx.is_finite() || !dy.is_finite() {
+        return;
+    }
+    let (x, y) = MOVE_REMAINDER.with(|remainder| whole_steps(&mut remainder.borrow_mut(), dx, dy));
+    if (x, y) != (0, 0)
+        && let Err(error) = enigo.move_mouse(x, y, Coordinate::Rel)
+    {
+        tracing::warn!(%error, "could not move native mouse");
+    }
+}
+
+/// Adds a fractional delta to `remainder` and takes out the whole steps, so small deltas aren't lost.
+fn whole_steps(remainder: &mut (f64, f64), dx: f64, dy: f64) -> (i32, i32) {
+    remainder.0 += dx;
+    remainder.1 += dy;
+    let steps = (remainder.0 as i32, remainder.1 as i32);
+    remainder.0 -= f64::from(steps.0);
+    remainder.1 -= f64::from(steps.1);
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_moves_are_parsed_and_never_coalesced() {
+        let message = br#"{"type":"mouseMoveRelative","dx":3.5,"dy":-2}"#;
+        assert!(matches!(
+            serde_json::from_slice::<Message>(message),
+            Ok(Message::MouseMoveRelative { dx: 3.5, dy: -2.0 })
+        ));
+        // Coalescing keeps only the last absolute move; doing that to deltas would drop movement.
+        assert!(!is_mouse_move(message));
+    }
+
+    #[test]
+    fn fractional_deltas_accumulate_into_whole_steps() {
+        let mut remainder = (0.0, 0.0);
+        assert_eq!(whole_steps(&mut remainder, 0.4, -0.6), (0, 0));
+        assert_eq!(whole_steps(&mut remainder, 0.4, -0.6), (0, -1));
+        assert_eq!(whole_steps(&mut remainder, 0.4, 0.0), (1, 0));
+        assert!((remainder.0 - 0.2).abs() < 1e-9 && (remainder.1 + 0.2).abs() < 1e-9);
+    }
 
     #[test]
     fn coalesces_only_consecutive_mouse_moves() {

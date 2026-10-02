@@ -84,6 +84,13 @@ function Viewer() {
   const [fullscreen, setFullscreen] = useState(false)
   const [streamAspect, setStreamAspect] = useState(16 / 9)
   const [clientMouseVisible, setClientMouseVisible] = useState(true)
+  const [relativeMouse, setRelativeMouse] = useState(false)
+  const [cursorLock, setCursorLock] = useState(false)
+  // Read by input handlers created once per connection.
+  const relativeMouseRef = useRef(relativeMouse)
+  const cursorLockRef = useRef(cursorLock)
+  relativeMouseRef.current = relativeMouse
+  cursorLockRef.current = cursorLock
   const [resolution, setResolution] = useState<number | null>(null)
   const [codec, setCodec] = useState<Codec | null>(null)
   const [bitrate, setBitrate] = useState<number | null>(null)
@@ -134,7 +141,15 @@ function Viewer() {
       } catch {
         // Keyboard Lock is not available in every browser.
       }
+      if (cursorLockRef.current) lockCursor()
     }
+  }
+
+  function lockCursor() {
+    const element = video.current
+    if (!element || document.pointerLockElement === element) return
+    // Can be refused without a recent click; the next click in fullscreen tries again.
+    Promise.resolve(element.requestPointerLock()).catch(() => {})
   }
 
   useEffect(() => {
@@ -287,6 +302,7 @@ function Viewer() {
       }
       // A second button pressed or released mid-press only shows up in `buttons` (on pointermove), so diff the mask.
       let pressedButtons = 0
+      let lastPosition = { x: 0.5, y: 0.5 }
       const syncMouseButtons = (event: PointerEvent) => {
         if (event.pointerType !== 'mouse' || input.readyState !== 'open') return
         if (document.fullscreenElement !== player.current) return
@@ -302,8 +318,9 @@ function Viewer() {
         video.current?.focus()
         if (document.fullscreenElement !== player.current) return
         event.preventDefault()
-        // Keep receiving moves and the release even if the pointer leaves the video.
-        video.current?.setPointerCapture(event.pointerId)
+        // Keep receiving moves and the release even if the pointer leaves the video (not allowed while locked).
+        if (document.pointerLockElement !== video.current) video.current?.setPointerCapture(event.pointerId)
+        if (cursorLockRef.current) lockCursor()
         syncMouseButtons(event)
       }
       const sendKey = (type: 'keyDown' | 'keyUp', event: KeyboardEvent) => {
@@ -322,7 +339,9 @@ function Viewer() {
         if (input.readyState === 'open') input.send(JSON.stringify({ type: 'releaseAll' }))
       }
       const leaveFullscreen = () => {
-        if (document.fullscreenElement !== player.current) releaseAll()
+        if (document.fullscreenElement === player.current) return
+        releaseAll()
+        if (document.pointerLockElement) document.exitPointerLock()
       }
       window.addEventListener('blur', releaseAll)
       document.addEventListener('fullscreenchange', leaveFullscreen)
@@ -401,9 +420,19 @@ function Viewer() {
             if (event.pointerType && event.pointerType !== 'mouse') return
             if (document.fullscreenElement !== player.current) return
             syncMouseButtons(event)
-            const position = streamPosition(video.current!, event.clientX, event.clientY)
-            if (position && pointer.readyState === 'open')
-              pointer.send(JSON.stringify({ type: 'mouseMove', ...position }))
+            if (pointer.readyState !== 'open') return
+            if (relativeMouseRef.current) {
+              if (event.movementX || event.movementY)
+                pointer.send(JSON.stringify({ type: 'mouseMoveRelative', dx: event.movementX, dy: event.movementY }))
+              return
+            }
+            // While locked the cursor doesn't move on screen, so track an absolute position from the deltas.
+            const position = document.pointerLockElement === video.current
+              ? lockedPosition(video.current!, lastPosition, event.movementX, event.movementY)
+              : streamPosition(video.current!, event.clientX, event.clientY)
+            if (!position) return
+            lastPosition = position
+            pointer.send(JSON.stringify({ type: 'mouseMove', ...position }))
           }
           video.current.onwheel = event => {
             if (document.fullscreenElement !== player.current) return
@@ -511,6 +540,14 @@ function Viewer() {
           className="rounded-lg border border-white/10 px-3 py-2 hover:bg-white/10 disabled:opacity-50">
           Host cursor: {hostMouseVisible ? 'visible' : 'hidden'}
         </button>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={relativeMouse} onChange={event => setRelativeMouse(event.target.checked)} />
+          Relative mouse
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={cursorLock} onChange={event => setCursorLock(event.target.checked)} />
+          Cursor lock
+        </label>
         <label className="flex items-center gap-2">
           Codec
           <select value={codec} onChange={event => sendStreamSettings({ codec: event.target.value as Codec })}
@@ -853,18 +890,27 @@ async function measureFrameTimings(
   }
 }
 
-function streamPosition(video: HTMLVideoElement, clientX: number, clientY: number) {
+function streamContent(video: HTMLVideoElement) {
   const rect = video.getBoundingClientRect()
   const streamAspect = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9
   const contentAspect = rect.width / rect.height
-  const contentWidth = contentAspect > streamAspect ? rect.height * streamAspect : rect.width
-  const contentHeight = contentAspect > streamAspect ? rect.height : rect.width / streamAspect
-  const left = rect.left + (rect.width - contentWidth) / 2
-  const top = rect.top + (rect.height - contentHeight) / 2
-  const x = (clientX - left) / contentWidth
-  const y = (clientY - top) / contentHeight
+  const width = contentAspect > streamAspect ? rect.height * streamAspect : rect.width
+  const height = contentAspect > streamAspect ? rect.height : rect.width / streamAspect
+  return { left: rect.left + (rect.width - width) / 2, top: rect.top + (rect.height - height) / 2, width, height }
+}
+
+function streamPosition(video: HTMLVideoElement, clientX: number, clientY: number) {
+  const content = streamContent(video)
+  const x = (clientX - content.left) / content.width
+  const y = (clientY - content.top) / content.height
   if (x < 0 || x > 1 || y < 0 || y > 1) return null
   return { x, y }
+}
+
+function lockedPosition(video: HTMLVideoElement, from: { x: number; y: number }, dx: number, dy: number) {
+  const content = streamContent(video)
+  const clamp = (value: number) => Math.min(1, Math.max(0, value))
+  return { x: clamp(from.x + dx / content.width), y: clamp(from.y + dy / content.height) }
 }
 
 createRoot(document.getElementById('root')!).render(
