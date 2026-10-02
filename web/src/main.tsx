@@ -86,7 +86,6 @@ function Viewer() {
   const [clientMouseVisible, setClientMouseVisible] = useState(true)
   const [relativeMouse, setRelativeMouse] = useState(false)
   const [cursorLock, setCursorLock] = useState(false)
-  // Read by input handlers created once per connection.
   const relativeMouseRef = useRef(relativeMouse)
   const cursorLockRef = useRef(cursorLock)
   relativeMouseRef.current = relativeMouse
@@ -150,9 +149,9 @@ function Viewer() {
   function lockCursor() {
     const element = video.current
     if (!element || document.pointerLockElement === element) return
-    // Raw movement skips the client's mouse acceleration, so relative moves aren't accelerated twice.
+    // Raw movement, so relative moves aren't accelerated by both client and host.
     const unadjustedMovement = relativeMouseRef.current && !unadjustedUnsupported.current
-    // Can be refused without a recent click; the next click in fullscreen tries again.
+    // Needs a recent click; the next click retries.
     Promise.resolve(element.requestPointerLock({ unadjustedMovement })).catch(error => {
       if (!unadjustedMovement || !(error instanceof DOMException) || error.name !== 'NotSupportedError') return
       unadjustedUnsupported.current = true
@@ -429,13 +428,13 @@ function Viewer() {
             if (document.fullscreenElement !== player.current) return
             syncMouseButtons(event)
             if (relativeMouseRef.current) {
-              // Reliable channel: a dropped delta would leave the host cursor permanently off.
+              // Reliable channel: a dropped delta is lost movement.
               if ((event.movementX || event.movementY) && input.readyState === 'open')
                 input.send(JSON.stringify({ type: 'mouseMoveRelative', dx: event.movementX, dy: event.movementY }))
               return
             }
             if (pointer.readyState !== 'open') return
-            // While locked the cursor doesn't move on screen, so track an absolute position from the deltas.
+            // The locked cursor doesn't move, so track the position from deltas.
             const position = document.pointerLockElement === video.current
               ? lockedPosition(video.current!, lastPosition, event.movementX, event.movementY)
               : streamPosition(video.current!, event.clientX, event.clientY)

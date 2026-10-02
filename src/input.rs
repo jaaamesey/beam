@@ -342,7 +342,7 @@ fn move_mouse_relative(enigo: &mut Enigo, dx: f64, dy: f64) {
     }
 }
 
-/// Adds a fractional delta to `remainder` and takes out the whole steps, so small deltas aren't lost.
+/// Accumulates fractional deltas and returns the whole steps.
 fn whole_steps(remainder: &mut (f64, f64), dx: f64, dy: f64) -> (i32, i32) {
     remainder.0 += dx;
     remainder.1 += dy;
@@ -363,7 +363,6 @@ mod tests {
             serde_json::from_slice::<Message>(message),
             Ok(Message::MouseMoveRelative { dx: 3.5, dy: -2.0 })
         ));
-        // Coalescing keeps only the last absolute move; doing that to deltas would drop movement.
         assert!(!is_mouse_move(message));
     }
 
